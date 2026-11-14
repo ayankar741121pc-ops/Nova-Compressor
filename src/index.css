@@ -30,6 +30,12 @@ body {
   overflow-x: hidden;
   background: linear-gradient(180deg, #0284c7 0%, #38bdf8 25%, #7dd3fc 55%, #bae6fd 80%, #e0f2fe 100%);
   color: #0f172a;
+  transition: background 0.7s cubic-bezier(0.16, 1, 0.3, 1), color 0.5s ease;
+}
+
+html.dark body {
+  background: linear-gradient(180deg, #020617 0%, #070d1d 20%, #0c142b 50%, #151030 80%, #030712 100%) fixed;
+  color: #f8fafc;
 }
 
 #root {
@@ -238,6 +244,61 @@ body {
   will-change: transform;
 }
 
+@keyframes moon-glow-pulse {
+  0%, 100% {
+    transform: scale(1);
+    opacity: 0.92;
+    filter: drop-shadow(0 0 35px rgba(199, 210, 254, 0.75)) drop-shadow(0 0 70px rgba(129, 140, 248, 0.45));
+  }
+  50% {
+    transform: scale(1.06);
+    opacity: 1;
+    filter: drop-shadow(0 0 55px rgba(224, 231, 255, 0.95)) drop-shadow(0 0 95px rgba(165, 180, 252, 0.65));
+  }
+}
+
+.animate-moon {
+  animation: moon-glow-pulse 5s ease-in-out infinite;
+  will-change: transform, filter;
+}
+
+@keyframes star-twinkle {
+  0%, 100% {
+    opacity: 0.25;
+    transform: scale(0.85);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.25);
+    filter: drop-shadow(0 0 8px rgba(255, 255, 255, 0.95));
+  }
+}
+
+.animate-twinkle {
+  animation: star-twinkle 3s ease-in-out infinite;
+}
+
+@keyframes shooting-star {
+  0% {
+    transform: translate3d(0, 0, 0) rotate(-38deg);
+    opacity: 0;
+  }
+  15% {
+    opacity: 1;
+  }
+  70% {
+    opacity: 0.9;
+  }
+  100% {
+    transform: translate3d(-460px, 380px, 0) rotate(-38deg);
+    opacity: 0;
+  }
+}
+
+.animate-shooting-star {
+  animation: shooting-star 9s cubic-bezier(0.25, 0.1, 0.25, 1) infinite;
+}
+
 .animate-plane {
   animation: plane-glide 28s linear infinite;
   will-change: transform;
@@ -255,6 +316,15 @@ body {
   box-shadow: 0 16px 40px -12px rgba(2, 132, 199, 0.16),
               0 4px 12px -2px rgba(14, 116, 144, 0.08),
               inset 0 1px 1px 0 rgba(255, 255, 255, 0.95);
+  transition: background 0.4s ease, border-color 0.4s ease, box-shadow 0.4s ease;
+}
+
+.dark .glass-sky {
+  background: rgba(15, 23, 42, 0.84);
+  border: 1px solid rgba(51, 65, 85, 0.75);
+  box-shadow: 0 16px 45px -10px rgba(0, 0, 0, 0.65),
+              0 0 30px -4px rgba(56, 189, 248, 0.1),
+              inset 0 1px 1px 0 rgba(255, 255, 255, 0.1);
 }
 
 .glass-sky-strong {
@@ -265,6 +335,15 @@ body {
   box-shadow: 0 24px 50px -12px rgba(3, 105, 161, 0.22),
               0 8px 20px -4px rgba(14, 116, 144, 0.12),
               inset 0 2px 2px 0 rgba(255, 255, 255, 1);
+  transition: background 0.4s ease, border-color 0.4s ease, box-shadow 0.4s ease;
+}
+
+.dark .glass-sky-strong {
+  background: rgba(15, 23, 42, 0.92);
+  border: 1px solid rgba(71, 85, 105, 0.85);
+  box-shadow: 0 24px 60px -10px rgba(0, 0, 0, 0.75),
+              0 0 35px -2px rgba(99, 102, 241, 0.18),
+              inset 0 2px 2px 0 rgba(255, 255, 255, 0.12);
 }
 
 .glass-sky-pill {
@@ -273,6 +352,13 @@ body {
   -webkit-backdrop-filter: blur(12px);
   border: 1px solid rgba(255, 255, 255, 0.9);
   box-shadow: 0 4px 12px rgba(2, 132, 199, 0.1);
+  transition: background 0.4s ease, border-color 0.4s ease, box-shadow 0.4s ease;
+}
+
+.dark .glass-sky-pill {
+  background: rgba(15, 23, 42, 0.88);
+  border: 1px solid rgba(51, 65, 85, 0.8);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
 }
 
 .glass-input {
@@ -287,6 +373,18 @@ body {
   border-color: #0284c7;
   box-shadow: 0 0 0 4px rgba(56, 189, 248, 0.25);
   outline: none;
+}
+
+.dark .glass-input {
+  background: rgba(15, 23, 42, 0.85);
+  border-color: rgba(51, 65, 85, 0.9);
+  color: #f8fafc;
+}
+
+.dark .glass-input:focus {
+  background: rgba(30, 41, 59, 0.95);
+  border-color: #38bdf8;
+  box-shadow: 0 0 0 4px rgba(56, 189, 248, 0.25);
 }
 
 /* =========================================
@@ -338,16 +436,78 @@ body {
   color: #92400e;
 }
 
+.dark .badge-sunny {
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.25) 0%, rgba(217, 119, 6, 0.3) 100%);
+  border: 1px solid rgba(251, 191, 36, 0.4);
+  color: #fde68a;
+}
+
 .badge-sky {
   background: linear-gradient(135deg, #e0f2fe 0%, #bae6fd 100%);
   border: 1px solid #7dd3fc;
   color: #0369a1;
 }
 
+.dark .badge-sky {
+  background: linear-gradient(135deg, rgba(14, 165, 233, 0.25) 0%, rgba(2, 132, 199, 0.3) 100%);
+  border: 1px solid rgba(56, 189, 248, 0.4);
+  color: #7dd3fc;
+}
+
 .badge-mint {
   background: linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%);
   border: 1px solid #6ee7b7;
   color: #065f46;
+}
+
+.dark .badge-mint {
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.25) 0%, rgba(5, 150, 105, 0.3) 100%);
+  border: 1px solid rgba(52, 211, 153, 0.4);
+  color: #a7f3d0;
+}
+
+/* =========================================
+   VIBRANT TEXT STYLING & GLOW EFFECTS
+   ========================================= */
+
+.text-gradient-sky {
+  background: linear-gradient(135deg, #0284c7 0%, #2563eb 50%, #4f46e5 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.dark .text-gradient-sky {
+  background: linear-gradient(135deg, #38bdf8 0%, #818cf8 50%, #c084fc 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.text-gradient-sun {
+  background: linear-gradient(135deg, #f59e0b 0%, #ea580c 50%, #e11d48 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.dark .text-gradient-sun {
+  background: linear-gradient(135deg, #fbbf24 0%, #fb923c 50%, #f472b6 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.text-glow-sky {
+  text-shadow: 0 0 24px rgba(56, 189, 248, 0.45);
+}
+
+.text-glow-night {
+  text-shadow: 0 0 28px rgba(165, 180, 252, 0.65), 0 0 12px rgba(99, 102, 241, 0.4);
+}
+
+.text-glow-amber {
+  text-shadow: 0 0 24px rgba(245, 158, 11, 0.45);
 }
 
 /* Custom smooth scrollbar */
@@ -360,12 +520,25 @@ body {
   background: rgba(224, 242, 254, 0.6);
 }
 
+.dark ::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, 0.8);
+}
+
 ::-webkit-scrollbar-thumb {
   background: rgba(56, 189, 248, 0.6);
   border-radius: 9999px;
   border: 2px solid rgba(255, 255, 255, 0.8);
 }
 
+.dark ::-webkit-scrollbar-thumb {
+  background: rgba(99, 102, 241, 0.6);
+  border-color: rgba(15, 23, 42, 0.8);
+}
+
 ::-webkit-scrollbar-thumb:hover {
   background: rgba(2, 132, 199, 0.85);
+}
+
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: rgba(129, 140, 248, 0.85);
 }
