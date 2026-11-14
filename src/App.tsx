@@ -4,7 +4,7 @@ import {
   UploadCloud, FileVideo, Download, Play, 
   Settings2, HardDrive, Cpu, Scissors, Video, 
   Menu, X, ChevronDown, CheckCircle2, AlertCircle, FileAudio,
-  Volume2, VolumeX, Sparkles, Sun, Moon, Stars, Cloud, Zap, 
+  Volume2, VolumeX, Sparkles, Sun, Moon, Cloud, Zap, 
   ShieldCheck, Sliders, RefreshCw, Award, ArrowRight,
   Smile
 } from 'lucide-react';
@@ -558,9 +558,6 @@ const OpenSkyAtmosphere = () => {
     </div>
   );
 };
-    </div>
-  );
-};
 
 // ==========================================
 // CELEBRATION CONFETTI
@@ -944,7 +941,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
   const activeRecorderRef = useRef<MediaRecorder | null>(null);
   const activeVideoElRef = useRef<HTMLVideoElement | null>(null);
 
-  const applyPreset = (targetMb: string, _label?: string) => {
+  const applyPreset = (targetMb: string) => {
     setSettings((prev) => {
       if (prev.targetSize === targetMb) {
         play('pop');
@@ -1320,7 +1317,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
                 return (
                   <button
                     key={idx}
-                    onClick={() => applyPreset(p.size, p.label)}
+                    onClick={() => applyPreset(p.size)}
                     className={`text-xs font-bold px-3 py-1.5 rounded-full border transition-all kickable flex items-center gap-1 ${
                       isSelected 
                         ? 'bg-gradient-to-r from-sky-500 to-blue-600 text-white border-sky-400 shadow-md ring-2 ring-sky-300 dark:ring-sky-500' 
@@ -1557,7 +1554,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
                           return (
                             <button
                               key={i}
-                              onClick={() => applyPreset(p.size, p.label)}
+                              onClick={() => applyPreset(p.size)}
                               className={`text-xs font-bold px-2.5 py-1 rounded-lg border transition-all kickable flex items-center gap-1 ${
                                 isSelected 
                                   ? 'bg-gradient-to-r from-sky-500 to-blue-600 text-white border-sky-400 shadow-sm ring-2 ring-sky-300 dark:ring-sky-500' 
