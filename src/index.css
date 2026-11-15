@@ -398,6 +398,18 @@ html.dark body {
   box-shadow: 0 0 0 4px rgba(56, 189, 248, 0.25);
 }
 
+select option {
+  background-color: #ffffff;
+  color: #0f172a;
+  padding: 8px 12px;
+}
+
+.dark select option {
+  background-color: #0f172a;
+  color: #f8fafc;
+  padding: 8px 12px;
+}
+
 /* =========================================
    PLAYFUL BUTTONS & MICRO-INTERACTIONS
    ========================================= */
@@ -486,6 +498,8 @@ html.dark body {
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
+  padding-bottom: 0.15em;
+  display: inline-block;
 }
 
 .dark .text-gradient-sky {
@@ -493,6 +507,8 @@ html.dark body {
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
+  padding-bottom: 0.15em;
+  display: inline-block;
 }
 
 .text-gradient-sun {
@@ -500,6 +516,8 @@ html.dark body {
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
+  padding-bottom: 0.15em;
+  display: inline-block;
 }
 
 .dark .text-gradient-sun {
@@ -507,6 +525,8 @@ html.dark body {
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
+  padding-bottom: 0.15em;
+  display: inline-block;
 }
 
 .text-glow-sky {
@@ -524,6 +544,10 @@ html.dark body {
 /* Night-only gradient & glow heading (matches 'Open Sky' in night mode, solid slate in day mode) */
 .night-gradient-heading {
   color: #0f172a;
+  display: inline-block;
+  line-height: 1.25;
+  padding-bottom: 0.25em;
+  padding-top: 0.05em;
 }
 
 .dark .night-gradient-heading {
@@ -532,6 +556,10 @@ html.dark body {
   background-clip: text;
   -webkit-text-fill-color: transparent;
   text-shadow: 0 0 24px rgba(56, 189, 248, 0.45);
+  display: inline-block;
+  line-height: 1.25;
+  padding-bottom: 0.25em;
+  padding-top: 0.05em;
 }
 
 /* =========================================

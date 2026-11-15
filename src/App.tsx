@@ -6,7 +6,7 @@ import {
   Menu, X, ChevronDown, CheckCircle2, AlertCircle, FileAudio,
   Volume2, VolumeX, Sparkles, Sun, Moon, Cloud, Zap, 
   ShieldCheck, Sliders, RefreshCw, Award, ArrowRight,
-  Smile
+  Smile, Check
 } from 'lucide-react';
 
 // ==========================================
@@ -1079,6 +1079,104 @@ const Footer = () => {
 // CORE VIDEO TOOL COMPONENT
 // ==========================================
 
+interface CustomSelectOption {
+  value: string;
+  label: string;
+}
+
+interface CustomSelectProps {
+  value: string;
+  options: CustomSelectOption[];
+  onChange: (value: string) => void;
+  disabled?: boolean;
+  className?: string;
+}
+
+const CustomSelect: React.FC<CustomSelectProps> = ({
+  value,
+  options,
+  onChange,
+  disabled = false,
+  className = ""
+}) => {
+  const [isOpen, setIsOpen] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+  const { play } = useSound();
+
+  const selectedOption = options.find((opt) => opt.value === value) || options[0];
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent | TouchEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+        setIsOpen(false);
+      }
+    };
+    if (isOpen) {
+      document.addEventListener('pointerdown', handleClickOutside);
+    }
+    return () => {
+      document.removeEventListener('pointerdown', handleClickOutside);
+    };
+  }, [isOpen]);
+
+  return (
+    <div className={`relative ${className}`} ref={dropdownRef}>
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => {
+          if (!disabled) {
+            play('pop');
+            setIsOpen((prev) => !prev);
+          }
+        }}
+        className={`w-full rounded-xl py-2.5 px-3.5 font-semibold text-xs sm:text-sm text-left flex items-center justify-between transition-all duration-200 border ${
+          disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer hover:border-sky-400 dark:hover:border-sky-500'
+        } ${
+          isOpen
+            ? 'ring-2 ring-sky-400/50 border-sky-400 dark:border-sky-500 bg-white/95 dark:bg-slate-900/95 shadow-md'
+            : 'bg-white/80 dark:bg-slate-900/80 border-sky-200/90 dark:border-slate-700/80 shadow-sm'
+        } text-slate-800 dark:text-slate-100 backdrop-blur-md`}
+      >
+        <span className="truncate pr-2">{selectedOption ? selectedOption.label : value}</span>
+        <ChevronDown
+          size={16}
+          className={`text-sky-600 dark:text-sky-400 shrink-0 transition-transform duration-200 ${
+            isOpen ? 'rotate-180' : ''
+          }`}
+        />
+      </button>
+
+      {isOpen && (
+        <div className="absolute z-50 left-0 right-0 mt-1.5 p-1.5 rounded-2xl bg-white/95 dark:bg-slate-900/95 backdrop-blur-xl border border-sky-200/90 dark:border-slate-700/80 shadow-2xl shadow-sky-500/10 dark:shadow-black/70 max-h-60 overflow-y-auto">
+          {options.map((option) => {
+            const isSelected = option.value === value;
+            return (
+              <button
+                key={option.value}
+                type="button"
+                onClick={() => {
+                  play('pop');
+                  onChange(option.value);
+                  setIsOpen(false);
+                }}
+                className={`w-full px-3 py-2 rounded-xl text-left text-xs sm:text-sm font-semibold transition-all flex items-center justify-between gap-2 ${
+                  isSelected
+                    ? 'bg-gradient-to-r from-sky-500 to-blue-600 text-white font-bold shadow-sm'
+                    : 'text-slate-700 dark:text-slate-300 hover:bg-sky-50 dark:hover:bg-slate-800/80 hover:text-sky-600 dark:hover:text-sky-300'
+                }`}
+              >
+                <span className="truncate">{option.label}</span>
+                {isSelected && <Check size={15} className="shrink-0 text-white" />}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+};
+
 const VideoTool = ({ defaultMode = 'compress' }) => {
   const { play } = useSound();
   const [file, setFile] = useState<File | null>(null);
@@ -1755,39 +1853,33 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                       <div>
                         <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-2">Output Format</label>
-                        <select 
-                          className="w-full glass-input rounded-xl py-2.5 px-3 font-semibold text-sm"
+                        <CustomSelect
                           value={settings.outputFormat}
-                          onChange={(e) => {
-                            play('pop');
-                            setSettings({...settings, outputFormat: e.target.value});
-                          }}
+                          onChange={(val) => setSettings({...settings, outputFormat: val})}
                           disabled={isProcessing}
-                        >
-                          <option value="mp4">MP4 (Universal standard)</option>
-                          <option value="webm">WebM (Fast web embed)</option>
-                          <option value="mov">MOV (QuickTime)</option>
-                          <option value="mkv">MKV (Matroska)</option>
-                        </select>
+                          options={[
+                            { value: 'mp4', label: 'MP4 (Universal standard)' },
+                            { value: 'webm', label: 'WebM (Fast web embed)' },
+                            { value: 'mov', label: 'MOV (QuickTime)' },
+                            { value: 'mkv', label: 'MKV (Matroska)' }
+                          ]}
+                        />
                       </div>
 
                       <div>
                         <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-2">Resolution Downscale</label>
-                        <select 
-                          className="w-full glass-input rounded-xl py-2.5 px-3 font-semibold text-sm"
+                        <CustomSelect
                           value={settings.resolution}
-                          onChange={(e) => {
-                            play('pop');
-                            setSettings({...settings, resolution: e.target.value});
-                          }}
+                          onChange={(val) => setSettings({...settings, resolution: val})}
                           disabled={isProcessing}
-                        >
-                          <option value="keep">Keep Original Dimensions</option>
-                          <option value="1080p">1080p (Full HD)</option>
-                          <option value="720p">720p (HD - Best for chats)</option>
-                          <option value="480p">480p (SD - Tiny size)</option>
-                          <option value="360p">360p (Ultra-Light - Max saving)</option>
-                        </select>
+                          options={[
+                            { value: 'keep', label: 'Keep Original Dimensions' },
+                            { value: '1080p', label: '1080p (Full HD)' },
+                            { value: '720p', label: '720p (HD - Best for chats)' },
+                            { value: '480p', label: '480p (SD - Tiny size)' },
+                            { value: '360p', label: '360p (Ultra-Light - Max saving)' }
+                          ]}
+                        />
                       </div>
                     </div>
 
@@ -1795,37 +1887,31 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                       <div>
                         <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-2">Frame Rate (FPS)</label>
-                        <select 
-                          className="w-full glass-input rounded-xl py-2.5 px-3 font-semibold text-sm"
+                        <CustomSelect
                           value={settings.frameRate}
-                          onChange={(e) => {
-                            play('pop');
-                            setSettings({...settings, frameRate: e.target.value});
-                          }}
+                          onChange={(val) => setSettings({...settings, frameRate: val})}
                           disabled={isProcessing}
-                        >
-                          <option value="keep">Original Frame Rate</option>
-                          <option value="60">60 FPS (Ultra Smooth)</option>
-                          <option value="30">30 FPS (Standard Web & Mobile)</option>
-                          <option value="24">24 FPS (Fast Chat / WhatsApp)</option>
-                        </select>
+                          options={[
+                            { value: 'keep', label: 'Original Frame Rate' },
+                            { value: '60', label: '60 FPS (Ultra Smooth)' },
+                            { value: '30', label: '30 FPS (Standard Web & Mobile)' },
+                            { value: '24', label: '24 FPS (Fast Chat / WhatsApp)' }
+                          ]}
+                        />
                       </div>
 
                       <div>
                         <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-2">Encoding Engine Speed</label>
-                        <select 
-                          className="w-full glass-input rounded-xl py-2.5 px-3 font-semibold text-sm"
+                        <CustomSelect
                           value={settings.encodingSpeed}
-                          onChange={(e) => {
-                            play('pop');
-                            setSettings({...settings, encodingSpeed: e.target.value});
-                          }}
+                          onChange={(val) => setSettings({...settings, encodingSpeed: val})}
                           disabled={isProcessing}
-                        >
-                          <option value="turbo">⚡ Turbo (Fastest Encoding)</option>
-                          <option value="balanced">⚖️ Balanced (Recommended)</option>
-                          <option value="studio">💎 Studio (Maximum Fidelity)</option>
-                        </select>
+                          options={[
+                            { value: 'turbo', label: '⚡ Turbo (Fastest Encoding)' },
+                            { value: 'balanced', label: '⚖️ Balanced (Recommended)' },
+                            { value: 'studio', label: '💎 Studio (Maximum Fidelity)' }
+                          ]}
+                        />
                       </div>
                     </div>
 
@@ -1901,37 +1987,31 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
                       {!settings.targetSize && (
                         <div>
                           <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-2">Compression Level</label>
-                          <select 
-                            className="w-full glass-input rounded-xl py-2 px-3 font-semibold text-sm"
+                          <CustomSelect
                             value={settings.qualityPreset}
-                            onChange={(e) => {
-                              play('pop');
-                              setSettings({...settings, qualityPreset: e.target.value});
-                            }}
+                            onChange={(val) => setSettings({...settings, qualityPreset: val})}
                             disabled={isProcessing}
-                          >
-                            <option value="fast">Aggressive (Smallest file)</option>
-                            <option value="medium">Balanced (Recommended)</option>
-                            <option value="slow">High Fidelity (Maximum clarity)</option>
-                          </select>
+                            options={[
+                              { value: 'fast', label: 'Aggressive (Smallest file)' },
+                              { value: 'medium', label: 'Balanced (Recommended)' },
+                              { value: 'slow', label: 'High Fidelity (Maximum clarity)' }
+                            ]}
+                          />
                         </div>
                       )}
 
                       <div className={settings.targetSize ? 'sm:col-span-2' : ''}>
                         <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-2">Audio Handling</label>
-                        <select 
-                          className="w-full glass-input rounded-xl py-2 px-3 font-semibold text-sm"
+                        <CustomSelect
                           value={settings.audioAction}
-                          onChange={(e) => {
-                            play('pop');
-                            setSettings({...settings, audioAction: e.target.value});
-                          }}
+                          onChange={(val) => setSettings({...settings, audioAction: val})}
                           disabled={isProcessing}
-                        >
-                          <option value="keep">Keep Audio (128 kbps High Quality)</option>
-                          <option value="voice">Voice Optimized (64 kbps - Saves Audio Space)</option>
-                          <option value="remove">Remove Audio (Mute - Max Size Saving)</option>
-                        </select>
+                          options={[
+                            { value: 'keep', label: 'Keep Audio (128 kbps High Quality)' },
+                            { value: 'voice', label: 'Voice Optimized (64 kbps - Saves Audio Space)' },
+                            { value: 'remove', label: 'Remove Audio (Mute - Max Size Saving)' }
+                          ]}
+                        />
                       </div>
                     </div>
                   </div>
@@ -1940,35 +2020,29 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
                   <div className="space-y-4">
                     <div>
                       <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-2">Audio Format</label>
-                      <select 
-                        className="w-full glass-input rounded-xl py-2.5 px-3 font-semibold text-sm"
+                      <CustomSelect
                         value={settings.audioFormat}
-                        onChange={(e) => {
-                          play('pop');
-                          setSettings({...settings, audioFormat: e.target.value});
-                        }}
+                        onChange={(val) => setSettings({...settings, audioFormat: val})}
                         disabled={isProcessing}
-                      >
-                        <option value="wav">WAV (Studio Lossless 44.1kHz)</option>
-                        <option value="mp3">MP3 (Universal Audio)</option>
-                      </select>
+                        options={[
+                          { value: 'wav', label: 'WAV (Studio Lossless 44.1kHz)' },
+                          { value: 'mp3', label: 'MP3 (Universal Audio)' }
+                        ]}
+                      />
                     </div>
 
                     <div>
                       <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-2">Audio Bitrate</label>
-                      <select 
-                        className="w-full glass-input rounded-xl py-2.5 px-3 font-semibold text-sm"
+                      <CustomSelect
                         value={settings.audioBitrate}
-                        onChange={(e) => {
-                          play('pop');
-                          setSettings({...settings, audioBitrate: e.target.value});
-                        }}
+                        onChange={(val) => setSettings({...settings, audioBitrate: val})}
                         disabled={isProcessing}
-                      >
-                        <option value="320k">320 kbps (Studio Quality)</option>
-                        <option value="192k">192 kbps (High Quality)</option>
-                        <option value="128k">128 kbps (Standard Voice / Podcast)</option>
-                      </select>
+                        options={[
+                          { value: '320k', label: '320 kbps (Studio Quality)' },
+                          { value: '192k', label: '192 kbps (High Quality)' },
+                          { value: '128k', label: '128 kbps (Standard Voice / Podcast)' }
+                        ]}
+                      />
                     </div>
                   </div>
                 )}
@@ -2300,7 +2374,11 @@ const SEOLandingPage = () => {
         <span className="badge-sky text-xs font-extrabold px-3 py-1 rounded-full uppercase tracking-wider mb-3 inline-block">
           Open Sky Video Studio
         </span>
-        <h1 className="text-3xl sm:text-4xl md:text-5xl font-black night-gradient-heading tracking-tight mb-4">{data.h1}</h1>
+        <h1 className="text-3xl sm:text-4xl md:text-5xl font-black tracking-tight mb-4 leading-normal">
+          <span className="night-gradient-heading inline-block pb-3 pt-1">
+            {data.h1}
+          </span>
+        </h1>
         <p className="text-base text-slate-600 dark:text-slate-300 max-w-2xl mx-auto leading-relaxed font-medium">{data.description}</p>
       </div>
 
