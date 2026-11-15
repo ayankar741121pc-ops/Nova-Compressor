@@ -259,6 +259,177 @@ const encodeAudioBufferToWav = (audioBuffer: AudioBuffer, targetSampleRate = 441
 };
 
 // ==========================================
+// CONTAINER DURATION REPAIR ENGINE (WHATSAPP & ANDROID FIX)
+// ==========================================
+
+const findSequence = (buf: Uint8Array, seq: number[], start = 0, end = buf.length): number => {
+  const seqLen = seq.length;
+  const limit = Math.min(buf.length, end) - seqLen;
+  for (let i = start; i <= limit; i++) {
+    let match = true;
+    for (let j = 0; j < seqLen; j++) {
+      if (buf[i + j] !== seq[j]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return i;
+  }
+  return -1;
+};
+
+const patchWebmDuration = (buffer: ArrayBuffer, durationSec: number): ArrayBuffer => {
+  try {
+    const u8 = new Uint8Array(buffer);
+    const view = new DataView(buffer);
+    const infoPos = findSequence(u8, [0x15, 0x49, 0xa9, 0x66], 0, Math.min(u8.length, 65536));
+    if (infoPos === -1) return buffer;
+
+    const durationMs = durationSec * 1000;
+    const searchLimit = Math.min(u8.length, infoPos + 350);
+    const durPos = findSequence(u8, [0x44, 0x89], infoPos, searchLimit);
+
+    if (durPos !== -1) {
+      const sizeByte = u8[durPos + 2];
+      if (sizeByte === 0x84) {
+        view.setFloat32(durPos + 3, durationMs, false);
+        return buffer;
+      } else if (sizeByte === 0x88) {
+        view.setFloat64(durPos + 3, durationMs, false);
+        return buffer;
+      }
+    }
+
+    // Insert EBML Duration element into Info segment
+    const durElement = new Uint8Array(11);
+    durElement[0] = 0x44;
+    durElement[1] = 0x89;
+    durElement[2] = 0x88;
+    const dv = new DataView(durElement.buffer);
+    dv.setFloat64(3, durationMs, false);
+
+    const lengthByte = u8[infoPos + 4];
+    let vintLength = 1;
+    let mask = 0x80;
+    while (vintLength <= 8 && (lengthByte & mask) === 0) {
+      mask >>= 1;
+      vintLength++;
+    }
+    const insertPos = infoPos + 4 + vintLength;
+
+    let oldInfoLength = lengthByte & (mask - 1);
+    for (let k = 1; k < vintLength; k++) {
+      oldInfoLength = (oldInfoLength << 8) | u8[infoPos + 4 + k];
+    }
+
+    const newBuffer = new Uint8Array(buffer.byteLength + durElement.length);
+    newBuffer.set(u8.subarray(0, insertPos), 0);
+    newBuffer.set(durElement, insertPos);
+    newBuffer.set(u8.subarray(insertPos), insertPos + durElement.length);
+
+    const newInfoLength = oldInfoLength + durElement.length;
+    if (vintLength === 4) {
+      newBuffer[infoPos + 4] = 0x10 | ((newInfoLength >> 24) & 0x0f);
+      newBuffer[infoPos + 5] = (newInfoLength >> 16) & 0xff;
+      newBuffer[infoPos + 6] = (newInfoLength >> 8) & 0xff;
+      newBuffer[infoPos + 7] = newInfoLength & 0xff;
+    } else if (vintLength === 2) {
+      newBuffer[infoPos + 4] = 0x40 | ((newInfoLength >> 8) & 0x3f);
+      newBuffer[infoPos + 5] = newInfoLength & 0xff;
+    }
+
+    return newBuffer.buffer;
+  } catch (e) {
+    console.warn('WebM duration patch skipped:', e);
+    return buffer;
+  }
+};
+
+const patchMp4Duration = (buffer: ArrayBuffer, durationSec: number): ArrayBuffer => {
+  try {
+    const u8 = new Uint8Array(buffer);
+    const view = new DataView(buffer);
+
+    // 1. Patch mvhd (Movie Header atom)
+    let mvhdTimescale = 1000;
+    const mvhdPos = findSequence(u8, [0x6d, 0x76, 0x68, 0x64], 0, Math.min(u8.length, 65536));
+    if (mvhdPos !== -1) {
+      const version = u8[mvhdPos + 4];
+      if (version === 0) {
+        mvhdTimescale = view.getUint32(mvhdPos + 16) || 1000;
+        view.setUint32(mvhdPos + 20, Math.round(durationSec * mvhdTimescale));
+      } else if (version === 1) {
+        mvhdTimescale = view.getUint32(mvhdPos + 24) || 1000;
+        view.setBigUint64(mvhdPos + 28, BigInt(Math.round(durationSec * mvhdTimescale)));
+      }
+    }
+
+    // 2. Patch all tkhd (Track Header atoms) with movie timescale so track durations are valid
+    let tkhdPos = 0;
+    while ((tkhdPos = findSequence(u8, [0x74, 0x6b, 0x68, 0x64], tkhdPos, Math.min(u8.length, 65536))) !== -1) {
+      const version = u8[tkhdPos + 4];
+      if (version === 0) {
+        view.setUint32(tkhdPos + 24, Math.round(durationSec * mvhdTimescale));
+      } else if (version === 1) {
+        view.setBigUint64(tkhdPos + 32, BigInt(Math.round(durationSec * mvhdTimescale)));
+      }
+      tkhdPos += 4;
+    }
+
+    // 3. Patch all mdhd (Media Header atoms) with their specific media track timescales
+    let mdhdPos = 0;
+    while ((mdhdPos = findSequence(u8, [0x6d, 0x64, 0x68, 0x64], mdhdPos, Math.min(u8.length, 65536))) !== -1) {
+      const version = u8[mdhdPos + 4];
+      if (version === 0) {
+        const ts = view.getUint32(mdhdPos + 16) || 1000;
+        view.setUint32(mdhdPos + 20, Math.round(durationSec * ts));
+      } else if (version === 1) {
+        const ts = view.getUint32(mdhdPos + 24) || 1000;
+        view.setBigUint64(mdhdPos + 28, BigInt(Math.round(durationSec * ts)));
+      }
+      mdhdPos += 4;
+    }
+
+    // 4. Patch mehd (Movie Extends Header atom in mvex) if present
+    const mehdPos = findSequence(u8, [0x6d, 0x65, 0x68, 0x64], 0, Math.min(u8.length, 65536));
+    if (mehdPos !== -1) {
+      const version = u8[mehdPos + 4];
+      if (version === 0) {
+        view.setUint32(mehdPos + 8, Math.round(durationSec * 1000));
+      } else if (version === 1) {
+        view.setBigUint64(mehdPos + 8, BigInt(Math.round(durationSec * 1000)));
+      }
+    }
+
+    return buffer;
+  } catch (e) {
+    console.warn('MP4 duration patch skipped:', e);
+    return buffer;
+  }
+};
+
+const fixMediaDuration = async (blob: Blob, durationSec: number): Promise<Blob> => {
+  if (!durationSec || durationSec <= 0) return blob;
+  try {
+    const arrayBuffer = await blob.arrayBuffer();
+    const type = blob.type.toLowerCase();
+    const isWebm = type.includes('webm') || (arrayBuffer.byteLength > 4 && new Uint8Array(arrayBuffer, 0, 4)[0] === 0x1a);
+    const isMp4 = type.includes('mp4') || (arrayBuffer.byteLength > 8 && findSequence(new Uint8Array(arrayBuffer, 0, 64), [0x66, 0x74, 0x79, 0x70]) !== -1);
+
+    let patched: ArrayBuffer = arrayBuffer;
+    if (isWebm) {
+      patched = patchWebmDuration(arrayBuffer, durationSec);
+    } else if (isMp4) {
+      patched = patchMp4Duration(arrayBuffer, durationSec);
+    }
+    return new Blob([patched], { type: blob.type });
+  } catch (err) {
+    console.warn('Error in fixMediaDuration:', err);
+    return blob;
+  }
+};
+
+// ==========================================
 // MOCK SEO DATA & CONFIGURATION
 // ==========================================
 
@@ -504,8 +675,8 @@ const OpenSkyAtmosphere = () => {
         </svg>
       </div>
 
-      {/* Layer 2: Midground Drifting Clouds with Soft Shadows */}
-      <div className={`absolute top-44 left-[-150px] animate-cloud-medium transition-opacity duration-700 ${isDark ? 'opacity-40' : 'opacity-85'}`}>
+      {/* Layer 2: Midground Drifting Clouds with Soft Shadows (Desktop only for max mobile 60 FPS) */}
+      <div className={`hidden md:block absolute top-44 left-[-150px] animate-cloud-medium transition-opacity duration-700 ${isDark ? 'opacity-40' : 'opacity-85'}`}>
         <svg width="780" height="190" viewBox="0 0 780 190" fill="none">
           <path 
             d="M80 160 C 40 160 10 135 10 95 C 10 55 50 30 95 40 C 130 -5 205 -10 260 25 C 305 -15 390 -5 425 45 C 480 35 530 75 520 125 C 560 135 570 160 530 160 Z" 
@@ -530,8 +701,8 @@ const OpenSkyAtmosphere = () => {
         </svg>
       </div>
 
-      {/* Layer 3: Lower Breezy Clouds */}
-      <div className={`absolute top-[520px] -right-20 animate-cloud-fast transition-opacity duration-700 ${isDark ? 'opacity-35' : 'opacity-75'}`}>
+      {/* Layer 3: Lower Breezy Clouds (Desktop only for max mobile 60 FPS) */}
+      <div className={`hidden md:block absolute top-[520px] -right-20 animate-cloud-fast transition-opacity duration-700 ${isDark ? 'opacity-35' : 'opacity-75'}`}>
         <svg width="680" height="170" viewBox="0 0 680 170" fill="none">
           <path 
             d="M60 140 C 30 140 5 120 5 90 C 5 55 40 35 75 42 C 105 5 170 0 215 30 C 255 -5 325 5 355 45 C 400 40 440 70 435 110 C 470 120 475 140 440 140 Z" 
@@ -927,6 +1098,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
     outputFormat: 'mp4',
     resolution: 'keep',
     frameRate: 'keep',
+    encodingSpeed: 'balanced',
     qualityPreset: 'medium',
     bitrateMode: 'auto',
     customBitrate: 2500,
@@ -1088,7 +1260,11 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       targetH = Math.max(2, targetH % 2 === 0 ? targetH : targetH + 1);
 
       const includeAudio = settings.audioAction !== 'remove';
-      const audioBps = includeAudio ? 128000 : 0;
+      const audioBps = !includeAudio 
+        ? 0 
+        : settings.audioAction === 'voice' 
+        ? 64000 
+        : 128000;
       const targetMb = settings.targetSize ? parseFloat(settings.targetSize) : null;
       let videoBps = 2500000;
 
@@ -1102,26 +1278,41 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         const originalBps = (file.size * 8) / duration;
         const presetFactor =
           settings.qualityPreset === 'fast'
-            ? 0.35
+            ? 0.32
             : settings.qualityPreset === 'medium'
-            ? 0.5
+            ? 0.48
             : 0.68;
         videoBps = Math.max(120000, Math.floor(originalBps * presetFactor - audioBps));
       }
 
       const { mimeType, baseMime, ext } = getSupportedVideoConfig(settings.outputFormat, includeAudio);
-      const targetFps = settings.frameRate !== 'keep' ? parseInt(settings.frameRate, 10) || 30 : 30;
+      const targetFps = settings.frameRate !== 'keep' 
+        ? parseInt(settings.frameRate, 10) || 30 
+        : settings.encodingSpeed === 'turbo' 
+        ? 24 
+        : 30;
 
       setProgressText(
-        `Encoding ${targetW}x${targetH} @ ${Math.round(videoBps / 1000)} kbps...`
+        `Optimizing ${targetW}x${targetH} @ ${targetFps} FPS (${Math.round(videoBps / 1000)} kbps)...`
       );
 
       const hiddenVideo = document.createElement('video');
       activeVideoElRef.current = hiddenVideo;
       hiddenVideo.src = URL.createObjectURL(file);
       hiddenVideo.playsInline = true;
+      hiddenVideo.muted = !includeAudio;
       hiddenVideo.crossOrigin = 'anonymous';
       hiddenVideo.preload = 'auto';
+
+      // Attach offscreen in DOM so mobile browsers won't pause playback after 3s
+      hiddenVideo.style.position = 'fixed';
+      hiddenVideo.style.top = '-9999px';
+      hiddenVideo.style.left = '-9999px';
+      hiddenVideo.style.width = '2px';
+      hiddenVideo.style.height = '2px';
+      hiddenVideo.style.opacity = '0.01';
+      hiddenVideo.style.pointerEvents = 'none';
+      document.body.appendChild(hiddenVideo);
 
       await new Promise<void>((resolve, reject) => {
         hiddenVideo.onloadeddata = () => resolve();
@@ -1131,7 +1322,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       const canvas = document.createElement('canvas');
       canvas.width = targetW;
       canvas.height = targetH;
-      const ctx = canvas.getContext('2d');
+      const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true }) || canvas.getContext('2d');
       if (!ctx) throw new Error('Could not initialize 2D video frame buffer.');
 
       ctx.drawImage(hiddenVideo, 0, 0, targetW, targetH);
@@ -1178,35 +1369,94 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
 
       const encodedBlobPromise = new Promise<Blob>((resolve, reject) => {
         recorder.onstop = () => {
-          const finalBlob = new Blob(chunks, { type: baseMime });
-          resolve(finalBlob);
+          const rawBlob = new Blob(chunks, { type: baseMime });
+          resolve(rawBlob);
         };
         recorder.onerror = (event: any) => {
           reject(new Error(event?.error?.message || 'Hardware encoder error occurred.'));
         };
       });
 
-      const drawInterval = window.setInterval(() => {
-        if (!hiddenVideo.paused && !hiddenVideo.ended) {
+      let hasEnded = false;
+      let frameCallbackId: number | null = null;
+      let animationFrameId: number | null = null;
+      let watchdogTimer: number | null = null;
+
+      const finishEncoding = () => {
+        if (hasEnded) return;
+        hasEnded = true;
+        if (watchdogTimer) window.clearInterval(watchdogTimer);
+        if (frameCallbackId !== null && 'cancelVideoFrameCallback' in hiddenVideo) {
+          try {
+            (hiddenVideo as any).cancelVideoFrameCallback(frameCallbackId);
+          } catch {}
+        }
+        if (animationFrameId !== null) {
+          cancelAnimationFrame(animationFrameId);
+        }
+        if (recorder.state !== 'inactive') {
+          try {
+            recorder.stop();
+          } catch {}
+        }
+      };
+
+      const renderFrame = () => {
+        if (!hasEnded && !hiddenVideo.paused && !hiddenVideo.ended) {
           ctx.drawImage(hiddenVideo, 0, 0, targetW, targetH);
-          const pct = Math.min(99, Math.round((hiddenVideo.currentTime / duration) * 100));
+          const currentT = hiddenVideo.currentTime;
+          const pct = Math.min(99, Math.round((currentT / duration) * 100));
           setProgress(pct);
         }
-      }, Math.round(1000 / targetFps));
+      };
+
+      // Hardware-accelerated frame synchronization to eliminate lagging and FPS drops
+      if ('requestVideoFrameCallback' in hiddenVideo) {
+        const onVideoFrame = () => {
+          if (!hasEnded && !abortRef.current) {
+            renderFrame();
+            frameCallbackId = (hiddenVideo as any).requestVideoFrameCallback(onVideoFrame);
+          }
+        };
+        frameCallbackId = (hiddenVideo as any).requestVideoFrameCallback(onVideoFrame);
+      } else {
+        const onAnimFrame = () => {
+          if (!hasEnded && !abortRef.current) {
+            renderFrame();
+            animationFrameId = requestAnimationFrame(onAnimFrame);
+          }
+        };
+        animationFrameId = requestAnimationFrame(onAnimFrame);
+      }
+
+      hiddenVideo.onended = () => {
+        finishEncoding();
+      };
+
+      // Watchdog: ensures video does not stall on mobile or stop prematurely
+      watchdogTimer = window.setInterval(() => {
+        if (abortRef.current) {
+          finishEncoding();
+          return;
+        }
+        if (hiddenVideo.paused && !hiddenVideo.ended) {
+          hiddenVideo.play().catch(() => {});
+        }
+        if (hiddenVideo.currentTime >= duration - 0.08) {
+          finishEncoding();
+        }
+      }, 200);
 
       recorder.start(100);
       await hiddenVideo.play();
 
-      await new Promise<void>((resolve) => {
-        hiddenVideo.onended = () => resolve();
-      });
+      const rawBlob = await encodedBlobPromise;
+      finishEncoding();
 
-      window.clearInterval(drawInterval);
-      if (recorder.state !== 'inactive') {
-        recorder.stop();
+      if (hiddenVideo.parentNode) {
+        hiddenVideo.parentNode.removeChild(hiddenVideo);
       }
 
-      const finalBlob = await encodedBlobPromise;
       outputStream.getTracks().forEach((t) => t.stop());
       if (audioCtx) {
         await audioCtx.close();
@@ -1215,9 +1465,13 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
 
       if (abortRef.current) return;
 
-      if (finalBlob.size === 0) {
+      if (rawBlob.size === 0) {
         throw new Error('Encoded output was 0 bytes. Please try another format or resolution.');
       }
+
+      // Fix container duration metadata (resolves WhatsApp & Android 3-second playback issue)
+      setProgressText('Fixing container duration for WhatsApp & Gallery compatibility...');
+      const finalBlob = await fixMediaDuration(rawBlob, duration);
 
       setProgress(100);
       const finalUrl = URL.createObjectURL(finalBlob);
@@ -1227,7 +1481,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         const actualMb = finalBlob.size / (1024 * 1024);
         if (actualMb > targetMb * 1.1) {
           setTargetMessage(
-            `Note: Final size is ${actualMb.toFixed(2)} MB. Lowering the resolution (e.g. to 480p) will help reach smaller targets.`
+            `Note: Final size is ${actualMb.toFixed(2)} MB. Lowering the resolution (e.g. to 480p or 360p) will help reach smaller targets.`
           );
         }
       }
@@ -1250,6 +1504,11 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
           : 'A critical error occurred while encoding this media file.'
       );
     } finally {
+      if (activeVideoElRef.current && activeVideoElRef.current.parentNode) {
+        try {
+          activeVideoElRef.current.parentNode.removeChild(activeVideoElRef.current);
+        } catch {}
+      }
       if (!abortRef.current) {
         setIsProcessing(false);
         setProgressText('');
@@ -1308,10 +1567,11 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
                 <Sparkles size={13} className="text-amber-500" /> Presets:
               </span>
               {[
-                { label: 'Discord 8MB', size: '8' },
-                { label: 'WhatsApp 16MB', size: '16' },
-                { label: 'Email 25MB', size: '25' },
-                { label: 'Lite 50MB', size: '50' }
+                { label: '5 MB (Ultra-Light)', size: '5' },
+                { label: '8 MB (Discord)', size: '8' },
+                { label: '16 MB (WhatsApp)', size: '16' },
+                { label: '25 MB (Email)', size: '25' },
+                { label: '50 MB (Balanced)', size: '50' }
               ].map((p, idx) => {
                 const isSelected = settings.targetSize === p.size;
                 return (
@@ -1526,6 +1786,45 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
                           <option value="1080p">1080p (Full HD)</option>
                           <option value="720p">720p (HD - Best for chats)</option>
                           <option value="480p">480p (SD - Tiny size)</option>
+                          <option value="360p">360p (Ultra-Light - Max saving)</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    {/* Framerate & Performance Mode */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-2">Frame Rate (FPS)</label>
+                        <select 
+                          className="w-full glass-input rounded-xl py-2.5 px-3 font-semibold text-sm"
+                          value={settings.frameRate}
+                          onChange={(e) => {
+                            play('pop');
+                            setSettings({...settings, frameRate: e.target.value});
+                          }}
+                          disabled={isProcessing}
+                        >
+                          <option value="keep">Original Frame Rate</option>
+                          <option value="60">60 FPS (Ultra Smooth)</option>
+                          <option value="30">30 FPS (Standard Web & Mobile)</option>
+                          <option value="24">24 FPS (Fast Chat / WhatsApp)</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-2">Encoding Engine Speed</label>
+                        <select 
+                          className="w-full glass-input rounded-xl py-2.5 px-3 font-semibold text-sm"
+                          value={settings.encodingSpeed}
+                          onChange={(e) => {
+                            play('pop');
+                            setSettings({...settings, encodingSpeed: e.target.value});
+                          }}
+                          disabled={isProcessing}
+                        >
+                          <option value="turbo">⚡ Turbo (Fastest Encoding)</option>
+                          <option value="balanced">⚖️ Balanced (Recommended)</option>
+                          <option value="studio">💎 Studio (Maximum Fidelity)</option>
                         </select>
                       </div>
                     </div>
@@ -1545,6 +1844,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
                       {/* Quick Preset Buttons */}
                       <div className="flex flex-wrap items-center gap-2 mb-3">
                         {[
+                          { label: '5 MB (Ultra-Light)', size: '5' },
                           { label: '8 MB (Discord)', size: '8' },
                           { label: '16 MB (WhatsApp)', size: '16' },
                           { label: '25 MB (Email)', size: '25' },
@@ -1596,9 +1896,9 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
                       </div>
                     </div>
 
-                    {/* Quality Presets (if no strict MB target) */}
-                    {!settings.targetSize && (
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    {/* Audio & Quality Configuration */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      {!settings.targetSize && (
                         <div>
                           <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-2">Compression Level</label>
                           <select 
@@ -1615,24 +1915,25 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
                             <option value="slow">High Fidelity (Maximum clarity)</option>
                           </select>
                         </div>
+                      )}
 
-                        <div>
-                          <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-2">Audio Track</label>
-                          <select 
-                            className="w-full glass-input rounded-xl py-2 px-3 font-semibold text-sm"
-                            value={settings.audioAction}
-                            onChange={(e) => {
-                              play('pop');
-                              setSettings({...settings, audioAction: e.target.value});
-                            }}
-                            disabled={isProcessing}
-                          >
-                            <option value="keep">Keep Audio Stream</option>
-                            <option value="remove">Remove Audio (Mute)</option>
-                          </select>
-                        </div>
+                      <div className={settings.targetSize ? 'sm:col-span-2' : ''}>
+                        <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-2">Audio Handling</label>
+                        <select 
+                          className="w-full glass-input rounded-xl py-2 px-3 font-semibold text-sm"
+                          value={settings.audioAction}
+                          onChange={(e) => {
+                            play('pop');
+                            setSettings({...settings, audioAction: e.target.value});
+                          }}
+                          disabled={isProcessing}
+                        >
+                          <option value="keep">Keep Audio (128 kbps High Quality)</option>
+                          <option value="voice">Voice Optimized (64 kbps - Saves Audio Space)</option>
+                          <option value="remove">Remove Audio (Mute - Max Size Saving)</option>
+                        </select>
                       </div>
-                    )}
+                    </div>
                   </div>
                 ) : (
                   /* Audio Extraction Options */
@@ -1807,9 +2108,9 @@ const Home = () => {
             </span>
           </div>
 
-          <h1 className="text-5xl md:text-7xl font-black text-slate-900 dark:text-white tracking-tight mb-6 leading-[1.12]">
+          <h1 className="text-3xl sm:text-5xl md:text-7xl font-black text-slate-900 dark:text-white tracking-tight mb-4 md:mb-6 leading-[1.14]">
             Compress Videos.<br />
-            <span className="text-gradient-sky text-glow-sky inline-block">
+            <span className="text-gradient-sky text-glow-sky dark:text-glow-night inline-block">
               Clear as an Open Sky.
             </span>
           </h1>
@@ -1999,7 +2300,7 @@ const SEOLandingPage = () => {
         <span className="badge-sky text-xs font-extrabold px-3 py-1 rounded-full uppercase tracking-wider mb-3 inline-block">
           Open Sky Video Studio
         </span>
-        <h1 className="text-4xl md:text-5xl font-black text-slate-900 dark:text-white tracking-tight mb-4">{data.h1}</h1>
+        <h1 className="text-3xl sm:text-4xl md:text-5xl font-black night-gradient-heading tracking-tight mb-4">{data.h1}</h1>
         <p className="text-base text-slate-600 dark:text-slate-300 max-w-2xl mx-auto leading-relaxed font-medium">{data.description}</p>
       </div>
 
@@ -2175,7 +2476,7 @@ export default function App() {
     playSoundEffect(type, soundEnabled);
   };
 
-  // Global click kick effect on any clicked icon or button
+  // Global click kick effect on any clicked icon or button (Asynchronously dispatched to avoid mobile reflows)
   useEffect(() => {
     const handleGlobalClick = (e: MouseEvent) => {
       const target = e.target as HTMLElement;
@@ -2185,14 +2486,16 @@ export default function App() {
         const svgEl = (kickEl.tagName.toLowerCase() === 'svg' ? kickEl : kickEl.querySelector('svg')) as HTMLElement;
         if (svgEl) {
           svgEl.classList.remove('kicking');
-          void svgEl.offsetWidth; // Trigger reflow
-          svgEl.classList.add('kicking');
-          setTimeout(() => svgEl.classList.remove('kicking'), 550);
+          requestAnimationFrame(() => {
+            svgEl.classList.add('kicking');
+            setTimeout(() => svgEl.classList.remove('kicking'), 550);
+          });
         } else {
           kickEl.classList.remove('kick-bounce-active');
-          void kickEl.offsetWidth;
-          kickEl.classList.add('kick-bounce-active');
-          setTimeout(() => kickEl.classList.remove('kick-bounce-active'), 500);
+          requestAnimationFrame(() => {
+            kickEl.classList.add('kick-bounce-active');
+            setTimeout(() => kickEl.classList.remove('kick-bounce-active'), 500);
+          });
         }
       }
     };

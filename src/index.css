@@ -1,5 +1,7 @@
 @import "tailwindcss";
 
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
   font-family: 'Plus Jakarta Sans', Inter, system-ui, -apple-system, BlinkMacSystemFont,
     "Segoe UI", Roboto, sans-serif;
@@ -217,31 +219,40 @@ html.dark body {
 .animate-cloud-slow {
   animation: cloud-drift-left 32s ease-in-out infinite;
   will-change: transform;
+  transform: translate3d(0, 0, 0);
+  backface-visibility: hidden;
 }
 
 .animate-cloud-medium {
   animation: cloud-drift-right 24s ease-in-out infinite;
   will-change: transform;
+  transform: translate3d(0, 0, 0);
+  backface-visibility: hidden;
 }
 
 .animate-cloud-fast {
   animation: cloud-drift-left 18s ease-in-out infinite;
   will-change: transform;
+  transform: translate3d(0, 0, 0);
+  backface-visibility: hidden;
 }
 
 .animate-balloon {
   animation: float-balloon 12s cubic-bezier(0.45, 0.05, 0.55, 0.95) infinite;
   will-change: transform;
+  transform: translate3d(0, 0, 0);
 }
 
 .animate-sun {
   animation: sun-glow-pulse 6s ease-in-out infinite;
   will-change: transform, filter;
+  transform: translate3d(0, 0, 0);
 }
 
 .animate-sun-rays {
   animation: sun-ray-rotate 40s linear infinite;
   will-change: transform;
+  transform: translate3d(0, 0, 0);
 }
 
 @keyframes moon-glow-pulse {
@@ -508,6 +519,52 @@ html.dark body {
 
 .text-glow-amber {
   text-shadow: 0 0 24px rgba(245, 158, 11, 0.45);
+}
+
+/* Night-only gradient & glow heading (matches 'Open Sky' in night mode, solid slate in day mode) */
+.night-gradient-heading {
+  color: #0f172a;
+}
+
+.dark .night-gradient-heading {
+  background: linear-gradient(135deg, #38bdf8 0%, #818cf8 50%, #c084fc 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  text-shadow: 0 0 24px rgba(56, 189, 248, 0.45);
+}
+
+/* =========================================
+   MOBILE 60 FPS PERFORMANCE & LAYOUT OPTIMIZATIONS
+   ========================================= */
+
+@media (max-width: 768px) {
+  /* Eliminate heavy blur shader passes that drag mobile chips down to 20 FPS */
+  .glass-sky,
+  .glass-sky-strong,
+  .glass-sky-pill {
+    backdrop-filter: blur(4px) !important;
+    -webkit-backdrop-filter: blur(4px) !important;
+    background: rgba(255, 255, 255, 0.95) !important;
+  }
+
+  .dark .glass-sky,
+  .dark .glass-sky-strong,
+  .dark .glass-sky-pill {
+    background: rgba(15, 23, 42, 0.96) !important;
+    backdrop-filter: blur(4px) !important;
+    -webkit-backdrop-filter: blur(4px) !important;
+  }
+
+  /* Optimize touch responsiveness across mobile viewports */
+  * {
+    touch-action: manipulation;
+  }
+
+  /* Prevent overflow or horizontal jitter */
+  body, html {
+    overflow-x: hidden;
+  }
 }
 
 /* Custom smooth scrollbar */
