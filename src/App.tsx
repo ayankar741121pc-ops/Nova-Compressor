@@ -1819,24 +1819,27 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       hiddenVideo.style.zIndex = '-999';
       document.body.appendChild(hiddenVideo);
 
-      await new Promise<void>((resolve, reject) => {
+      await new Promise<void>((resolve) => {
+        if (hiddenVideo.readyState >= 2) {
+          resolve();
+          return;
+        }
         let isDone = false;
         const onReady = () => {
-          if (!isDone) {
+          if (!isDone && hiddenVideo.readyState >= 1) {
             isDone = true;
             resolve();
           }
         };
-        hiddenVideo.onloadeddata = onReady;
-        hiddenVideo.oncanplay = onReady;
-        hiddenVideo.onloadedmetadata = onReady;
-        hiddenVideo.onerror = () => {
+        hiddenVideo.addEventListener('loadedmetadata', onReady, { once: true });
+        hiddenVideo.addEventListener('loadeddata', onReady, { once: true });
+        hiddenVideo.addEventListener('canplay', onReady, { once: true });
+        setTimeout(() => {
           if (!isDone) {
             isDone = true;
-            reject(new Error('Failed to load input video for encoding.'));
+            resolve();
           }
-        };
-        setTimeout(onReady, 1000);
+        }, 2500);
         hiddenVideo.load();
       });
 
@@ -1988,7 +1991,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         }
         const effectiveDuration = Number.isFinite(duration) && duration > 0.5 ? duration : 10;
         const currentT = hiddenVideo.currentTime;
-        const pct = Math.min(99, Math.max(5, Math.round((currentT / effectiveDuration) * 100)));
+        const pct = Math.min(99, Math.max(8, Math.round((currentT / effectiveDuration) * 100)));
         setProgress(pct);
 
         if (pct < 15) {
@@ -1999,12 +2002,12 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
           setProgressText('📦 Finalizing MP4 container & audio sync...');
         }
 
-        // Android stall recovery: if currentTime stops advancing, force manual frame stepping
+        // Android stall recovery: only kick if genuinely stalled for > 1.2s (40 frames)
         if (hiddenVideo.paused || currentT === lastTime) {
           stallCount++;
-          if (stallCount >= 3) {
+          if (stallCount >= 40) {
+            stallCount = 0;
             hiddenVideo.play().catch(() => {});
-            hiddenVideo.currentTime = Math.min(effectiveDuration, hiddenVideo.currentTime + (1 / targetFps));
           }
         } else {
           stallCount = 0;
@@ -2015,9 +2018,6 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
           finishEncoding();
         }
       };
-
-      const frameIntervalMs = Math.max(16, Math.floor(1000 / targetFps));
-      renderIntervalId = window.setInterval(renderFrame, frameIntervalMs);
 
       hiddenVideo.onended = () => {
         finishEncoding();
@@ -2030,16 +2030,14 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         }
         if (hiddenVideo.paused && !hiddenVideo.ended && !hasEnded) {
           hiddenVideo.play().catch(() => {});
-          renderFrame();
         }
         const effectiveDuration = Number.isFinite(duration) && duration > 0.5 ? duration : 10;
         if (hiddenVideo.currentTime >= effectiveDuration - 0.08) {
           finishEncoding();
         }
-      }, 150);
+      }, 250);
 
-      recorder.start(100);
-
+      // CRITICAL: Start hiddenVideo playback FIRST so frames are flowing BEFORE starting capture interval
       try {
         await hiddenVideo.play();
       } catch (playErr) {
@@ -2048,6 +2046,11 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         hiddenVideo.volume = 0;
         await hiddenVideo.play().catch(() => {});
       }
+
+      // ONLY start recorder and frame pumper AFTER hiddenVideo is actively playing:
+      recorder.start(100);
+      const frameIntervalMs = Math.max(16, Math.floor(1000 / targetFps));
+      renderIntervalId = window.setInterval(renderFrame, frameIntervalMs);
 
       const rawBlob = await encodedBlobPromise;
       finishEncoding();
