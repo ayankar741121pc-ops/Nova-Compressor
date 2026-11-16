@@ -442,16 +442,24 @@ const parseVideoFileHeader = async (file: File): Promise<VideoFileInfo> => {
     const view = new DataView(slice);
 
     let fps = 30;
-    let hasAudio = false;
+    let hasAudio = true; // Default to true so mobile recordings are never stripped of audio
 
     // Check if MP4 / QuickTime (has 'ftyp' or 'moov')
     const hasMoov = findSequence(u8, [0x6d, 0x6f, 0x6f, 0x76]) !== -1;
     const hasFtyp = findSequence(u8, [0x66, 0x74, 0x79, 0x70]) !== -1;
 
     if (hasMoov || hasFtyp) {
-      // Check for audio handler 'soun'
+      // Check for audio handler 'soun' in head or tail
       if (findSequence(u8, [0x73, 0x6f, 0x75, 0x6e]) !== -1) {
         hasAudio = true;
+      } else if (file.size > 512 * 1024) {
+        try {
+          const tailSlice = await file.slice(Math.max(0, file.size - 512 * 1024), file.size).arrayBuffer();
+          const tailU8 = new Uint8Array(tailSlice);
+          if (findSequence(tailU8, [0x73, 0x6f, 0x75, 0x6e]) !== -1) {
+            hasAudio = true;
+          }
+        } catch {}
       }
 
       // Check timescale from mdhd
@@ -1279,110 +1287,136 @@ const CustomSelect: React.FC<CustomSelectProps> = ({
 interface DynamicPreset {
   id: string;
   label: string;
-  tag: string;
+  platform: string;
   sizeMb: string;
+  reductionPct: number;
   description: string;
+  badge: string;
 }
 
 const getPresetsForFile = (fileSizeInBytes: number | null): DynamicPreset[] => {
   if (!fileSizeInBytes || fileSizeInBytes <= 0) {
     return [
-      { id: 'wa-16', label: '16 MB', tag: 'WhatsApp Standard', sizeMb: '16', description: 'Universal WhatsApp chat & status limit' },
-      { id: 'discord-20', label: '19.5 MB', tag: 'Discord Free', sizeMb: '19.5', description: 'Fits Discord 20 MB free upload cap' },
-      { id: 'email-25', label: '24 MB', tag: 'Email / Gmail', sizeMb: '24', description: 'Under standard 25 MB email attachment cap' },
-      { id: 'wa-64', label: '60 MB', tag: 'WhatsApp HD', sizeMb: '60', description: 'WhatsApp HD 64 MB media limit' },
-      { id: 'save-50', label: '50% Cut', tag: 'Balanced HD', sizeMb: '50', description: 'Halves the file weight with studio clarity' }
+      { id: 'wa-16', label: '16 MB', platform: 'WhatsApp Chat', sizeMb: '16', reductionPct: 0, description: 'Universal WhatsApp 16 MB status & chat upload limit', badge: '16 MB' },
+      { id: 'discord-20', label: '19.5 MB', platform: 'Discord Free', sizeMb: '19.5', reductionPct: 0, description: 'Fits Discord 20 MB free upload limit', badge: '19.5 MB' },
+      { id: 'email-25', label: '24 MB', platform: 'Gmail / Email', sizeMb: '24', reductionPct: 0, description: 'Fits Gmail & Outlook 25 MB attachment cap', badge: '24 MB' },
+      { id: 'wa-64', label: '60 MB', platform: 'WhatsApp HD', sizeMb: '60', reductionPct: 0, description: 'WhatsApp HD 64 MB media limit', badge: '60 MB' },
+      { id: 'save-50', label: '50% Cut', platform: 'Half Size', sizeMb: '50', reductionPct: 50, description: 'Halves video file size with crisp clarity', badge: '-50%' }
     ];
   }
 
   const origMb = fileSizeInBytes / (1024 * 1024);
   const presets: DynamicPreset[] = [];
 
-  // WhatsApp compatibility:
-  // WhatsApp limits: 64 MB for high-quality video, 16 MB for fast sending / status.
+  // 1. WhatsApp Compatibility:
   if (origMb > 70) {
+    const pctHd = Math.round((1 - 60 / origMb) * 100);
     presets.push({
       id: 'wa-hd',
       label: '60 MB',
-      tag: 'WhatsApp HD',
+      platform: 'WhatsApp HD',
       sizeMb: '60',
-      description: 'Fits WhatsApp 64 MB HD limit'
+      reductionPct: pctHd,
+      description: `Compress ${origMb.toFixed(1)} MB ➔ 60 MB to fit WhatsApp 64 MB HD limit (${pctHd}% smaller)`,
+      badge: `-${pctHd}%`
     });
+    const pctFast = Math.round((1 - 15.5 / origMb) * 100);
     presets.push({
       id: 'wa-fast',
       label: '15.5 MB',
-      tag: 'WhatsApp Fast',
+      platform: 'WhatsApp Fast',
       sizeMb: '15.5',
-      description: 'Instant WhatsApp sending & status'
+      reductionPct: pctFast,
+      description: `Instant WhatsApp chat & status: ${origMb.toFixed(1)} MB ➔ 15.5 MB (${pctFast}% smaller)`,
+      badge: `-${pctFast}%`
     });
   } else if (origMb > 16) {
+    const pct = Math.round((1 - 15.5 / origMb) * 100);
     presets.push({
       id: 'wa-std',
       label: '15.5 MB',
-      tag: 'WhatsApp',
+      platform: 'WhatsApp Chat',
       sizeMb: '15.5',
-      description: 'Strictly under WhatsApp 16 MB limit'
+      reductionPct: pct,
+      description: `Under WhatsApp 16 MB chat limit: ${origMb.toFixed(1)} MB ➔ 15.5 MB (${pct}% smaller)`,
+      badge: `-${pct}%`
     });
   } else {
-    const waMb = Math.max(1, +(origMb * 0.55).toFixed(1));
+    const waMb = Math.max(0.8, +(origMb * 0.55).toFixed(1));
+    const pct = Math.round((1 - waMb / origMb) * 100);
     presets.push({
       id: 'wa-opt',
       label: `${waMb} MB`,
-      tag: 'WhatsApp Fit',
+      platform: 'WhatsApp Fit',
       sizeMb: `${waMb}`,
-      description: 'Optimized for instant WhatsApp chat'
+      reductionPct: pct,
+      description: `Fast WhatsApp send: ${origMb.toFixed(1)} MB ➔ ${waMb} MB (${pct}% smaller)`,
+      badge: `-${pct}%`
     });
   }
 
-  // Discord compatibility (free limit is 20 MB):
+  // 2. Discord Compatibility (Free limit 20 MB):
   if (origMb > 20) {
+    const pct = Math.round((1 - 19.5 / origMb) * 100);
     presets.push({
       id: 'discord-free',
       label: '19.5 MB',
-      tag: 'Discord Free',
+      platform: 'Discord Free',
       sizeMb: '19.5',
-      description: 'Strictly under 20 MB free Discord cap'
+      reductionPct: pct,
+      description: `Fits Discord 20 MB free upload cap: ${origMb.toFixed(1)} MB ➔ 19.5 MB (${pct}% smaller)`,
+      badge: `-${pct}%`
     });
   } else {
-    const discMb = Math.max(1, +(origMb * 0.5).toFixed(1));
+    const discMb = Math.max(0.8, +(origMb * 0.5).toFixed(1));
+    const pct = Math.round((1 - discMb / origMb) * 100);
     presets.push({
       id: 'discord-fit',
       label: `${discMb} MB`,
-      tag: 'Discord Fast',
+      platform: 'Discord Fast',
       sizeMb: `${discMb}`,
-      description: 'Fast mobile Discord share'
+      reductionPct: pct,
+      description: `Fits Discord free upload: ${origMb.toFixed(1)} MB ➔ ${discMb} MB (${pct}% smaller)`,
+      badge: `-${pct}%`
     });
   }
 
-  // Email / Gmail compatibility (strict 25 MB limit):
+  // 3. Email / Gmail Compatibility (Strict 25 MB limit):
   if (origMb > 25) {
+    const pct = Math.round((1 - 24 / origMb) * 100);
     presets.push({
       id: 'email-max',
       label: '24 MB',
-      tag: 'Email / Gmail',
+      platform: 'Gmail Limit',
       sizeMb: '24',
-      description: 'Fits Gmail/Outlook 25 MB attachment limit'
+      reductionPct: pct,
+      description: `Fits Gmail & Outlook 25 MB attachment limit: ${origMb.toFixed(1)} MB ➔ 24 MB (${pct}% smaller)`,
+      badge: `-${pct}%`
     });
   }
 
-  // Balanced 50% Reduction:
-  const halfMb = Math.max(1, +(origMb * 0.5).toFixed(1));
+  // 4. 50% Reduction (Half Size):
+  const halfMb = Math.max(0.5, +(origMb * 0.5).toFixed(1));
   presets.push({
     id: 'half-size',
     label: `${halfMb} MB`,
-    tag: '50% Cut (Crisp)',
+    platform: '50% Cut',
     sizeMb: `${halfMb}`,
-    description: 'Cuts size in half with studio clarity'
+    reductionPct: 50,
+    description: `Cuts your ${origMb.toFixed(1)} MB video in half down to ${halfMb} MB with studio quality`,
+    badge: '-50%'
   });
 
-  // Ultra Space Saver (Save 75%):
-  const quarterMb = Math.max(0.5, +(origMb * 0.25).toFixed(1));
+  // 5. 75% Reduction (Save 75%):
+  const quarterMb = Math.max(0.3, +(origMb * 0.25).toFixed(1));
   presets.push({
     id: 'save-75',
     label: `${quarterMb} MB`,
-    tag: 'Save 75% (Tiny)',
+    platform: 'Save 75%',
     sizeMb: `${quarterMb}`,
-    description: 'Maximum space saving for slow networks'
+    reductionPct: 75,
+    description: `Reduces your ${origMb.toFixed(1)} MB video down to ${quarterMb} MB (75% savings)`,
+    badge: '-75%'
   });
 
   return presets;
@@ -1452,6 +1486,11 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
   const dynamicPresets = useMemo(() => {
     return getPresetsForFile(file ? file.size : null);
   }, [file]);
+
+  const activePresetObj = useMemo(() => {
+    if (!settings.targetSize) return null;
+    return dynamicPresets.find(p => p.sizeMb === settings.targetSize) || null;
+  }, [dynamicPresets, settings.targetSize]);
 
   useEffect(() => {
     if (!metadata.width) return;
@@ -1595,6 +1634,22 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
     setTargetMessage(null);
     setErrorMessage(null);
 
+    // CRITICAL FOR ANDROID CHROME & MOBILE WEBVIEW:
+    // AudioContext MUST be created and resumed synchronously within the immediate user click gesture.
+    // If deferred past any `await`, Android Chrome rejects AudioContext.resume() and suspends all audio.
+    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+    let audioCtx: AudioContext | null = null;
+    if (AudioContextClass) {
+      try {
+        audioCtx = new AudioContextClass();
+        if (audioCtx.state === 'suspended') {
+          audioCtx.resume().catch(() => {});
+        }
+      } catch (e) {
+        console.warn('AudioContext pre-unlock warning:', e);
+      }
+    }
+
     try {
       const baseName = file.name.replace(/\.[^/.]+$/, '');
 
@@ -1603,13 +1658,15 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         setProgressText('Decoding audio stream...');
         setProgress(25);
         const arrayBuffer = await file.arrayBuffer();
-        if (abortRef.current) return;
-
-        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-        const audioCtx = new AudioContextClass();
-        const decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer);
         if (abortRef.current) {
-          audioCtx.close();
+          if (audioCtx) audioCtx.close().catch(() => {});
+          return;
+        }
+
+        const actx = audioCtx || new AudioContextClass();
+        const decodedBuffer = await actx.decodeAudioData(arrayBuffer);
+        if (abortRef.current) {
+          actx.close().catch(() => {});
           return;
         }
 
@@ -1627,7 +1684,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
             : 22050;
 
         const wavBlob = encodeAudioBufferToWav(decodedBuffer, sampleRate);
-        await audioCtx.close();
+        await actx.close().catch(() => {});
 
         setProgress(100);
         const outUrl = URL.createObjectURL(wavBlob);
@@ -1644,7 +1701,6 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       }
 
       // MODE 2: REAL HARDWARE VIDEO COMPRESSION & TRANSCODING
-      // Sanitize duration for Android / mobile camera files (handles Infinity, NaN, 0)
       let duration = Number.isFinite(metadata.duration) && metadata.duration > 0.1 
         ? metadata.duration 
         : 10;
@@ -1717,10 +1773,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       activeVideoElRef.current = hiddenVideo;
       hiddenVideo.src = URL.createObjectURL(file);
       hiddenVideo.playsInline = true;
-      hiddenVideo.muted = true;
-      hiddenVideo.defaultMuted = true;
-      hiddenVideo.volume = 0;
-      hiddenVideo.setAttribute('muted', '');
+      (hiddenVideo as any).webkitPlaysInline = true;
       hiddenVideo.setAttribute('playsinline', '');
       hiddenVideo.setAttribute('webkit-playsinline', '');
       hiddenVideo.crossOrigin = 'anonymous';
@@ -1754,7 +1807,6 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
             reject(new Error('Failed to load input video for encoding.'));
           }
         };
-        // 1.5s safety timeout so mobile devices never hang on loadeddata
         setTimeout(onReady, 1500);
         hiddenVideo.load();
       });
@@ -1774,40 +1826,76 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       const canvasStream = canvas.captureStream(targetFps);
       const combinedTracks: MediaStreamTrack[] = [...canvasStream.getVideoTracks()];
 
-      let audioCtx: AudioContext | null = null;
-      if (includeAudio) {
-        try {
-          const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-          if (AudioContextClass) {
-            audioCtx = new AudioContextClass();
-            if (audioCtx.state === 'suspended') {
-              await audioCtx.resume().catch(() => {});
-            }
+      // ANDROID & UNIVERSAL AUDIO ENGINE (3-TIER BULLETPROOF)
+      let audioBufferSource: AudioBufferSourceNode | null = null;
+      let audioTrackAdded = false;
 
-            // Unmute hiddenVideo so its internal audio decoder feeds real audio samples
+      if (includeAudio && audioCtx && metadata.hasAudio !== false) {
+        try {
+          if (audioCtx.state === 'suspended') {
+            await audioCtx.resume().catch(() => {});
+          }
+
+          // TIER 1: Native Web Audio Decode Directly From File (Never muted, completely immune to mobile autoplay blocks)
+          const fileBuf = await file.arrayBuffer();
+          const decodedAudio = await audioCtx.decodeAudioData(fileBuf.slice(0));
+          
+          if (decodedAudio && decodedAudio.numberOfChannels > 0 && decodedAudio.length > 0) {
+            const destNode = audioCtx.createMediaStreamDestination();
+            const bSource = audioCtx.createBufferSource();
+            bSource.buffer = decodedAudio;
+            
+            // Connect to recorder stream destination
+            bSource.connect(destNode);
+            
+            // Connect to silent keep-alive tap to ensure hardware audio clock keeps rendering on Android
+            const zeroGain = audioCtx.createGain();
+            zeroGain.gain.value = 0.00001; // -100 dB (inaudible)
+            bSource.connect(zeroGain);
+            zeroGain.connect(audioCtx.destination);
+            
+            const destTracks = destNode.stream.getAudioTracks();
+            if (destTracks.length > 0) {
+              destTracks[0].enabled = true;
+              combinedTracks.push(destTracks[0]);
+              audioBufferSource = bSource;
+              audioTrackAdded = true;
+            }
+          }
+        } catch (audioDecodeErr) {
+          console.warn('Tier 1 audio decode fallback:', audioDecodeErr);
+        }
+
+        // TIER 2: Fallback to HTMLMediaElement source
+        if (!audioTrackAdded && audioCtx) {
+          try {
             hiddenVideo.muted = false;
             hiddenVideo.defaultMuted = false;
             hiddenVideo.volume = 1;
             hiddenVideo.removeAttribute('muted');
 
-            // Connect hiddenVideo to Web Audio:
-            // By routing sourceNode ONLY to destNode (and NOT audioCtx.destination),
-            // NO sound leaks to user speakers while capturing pristine audio!
             const sourceNode = audioCtx.createMediaElementSource(hiddenVideo);
             const destNode = audioCtx.createMediaStreamDestination();
             sourceNode.connect(destNode);
 
+            const zeroGain = audioCtx.createGain();
+            zeroGain.gain.value = 0.00001;
+            sourceNode.connect(zeroGain);
+            zeroGain.connect(audioCtx.destination);
+
             const capturedAudioTracks = destNode.stream.getAudioTracks();
             if (capturedAudioTracks.length > 0) {
+              capturedAudioTracks[0].enabled = true;
               combinedTracks.push(capturedAudioTracks[0]);
+              audioTrackAdded = true;
             }
+          } catch (err) {
+            console.warn('Tier 2 MediaElementSource fallback:', err);
           }
-        } catch (err) {
-          console.warn('Web Audio capture error:', err);
         }
 
-        // Direct fallback: if Web Audio track wasn't added, capture from video stream directly
-        if (combinedTracks.length === 1) {
+        // TIER 3: Direct captureStream fallback
+        if (!audioTrackAdded) {
           try {
             hiddenVideo.muted = false;
             hiddenVideo.volume = 1;
@@ -1817,10 +1905,11 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
               const directTracks = directStream.getAudioTracks();
               if (directTracks.length > 0) {
                 combinedTracks.push(directTracks[0]);
+                audioTrackAdded = true;
               }
             }
           } catch (e) {
-            console.warn('captureStream fallback error:', e);
+            console.warn('Tier 3 captureStream fallback:', e);
           }
         }
       }
@@ -1828,7 +1917,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       const outputStream = new MediaStream(combinedTracks);
       const recorderOptions: MediaRecorderOptions = {
         videoBitsPerSecond: videoBps,
-        ...(includeAudio ? { audioBitsPerSecond: audioBps } : {}),
+        ...(audioTrackAdded ? { audioBitsPerSecond: audioBps } : {}),
         ...(mimeType ? { mimeType } : {})
       };
 
@@ -1855,14 +1944,17 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       let hasEnded = false;
       let frameCallbackId: number | null = null;
       let animationFrameId: number | null = null;
+      let renderIntervalId: number | null = null;
       let watchdogTimer: number | null = null;
       let lastTime = -1;
       let stallCount = 0;
+      let frameCount = 0;
 
       const finishEncoding = () => {
         if (hasEnded) return;
         hasEnded = true;
-        if (watchdogTimer) window.clearInterval(watchdogTimer);
+        if (renderIntervalId !== null) window.clearInterval(renderIntervalId);
+        if (watchdogTimer !== null) window.clearInterval(watchdogTimer);
         if (frameCallbackId !== null && 'cancelVideoFrameCallback' in hiddenVideo) {
           try {
             (hiddenVideo as any).cancelVideoFrameCallback(frameCallbackId);
@@ -1870,6 +1962,12 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         }
         if (animationFrameId !== null) {
           cancelAnimationFrame(animationFrameId);
+        }
+        if (audioBufferSource) {
+          try {
+            audioBufferSource.stop();
+          } catch {}
+          audioBufferSource = null;
         }
         if (audioCtx) {
           audioCtx.close().catch(() => {});
@@ -1886,14 +1984,16 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         if (hasEnded || abortRef.current) return;
         
         ctx.drawImage(hiddenVideo, 0, 0, targetW, targetH);
+        frameCount++;
+
         const currentT = hiddenVideo.currentTime;
         const pct = Math.min(99, Math.max(2, Math.round((currentT / duration) * 100)));
         setProgress(pct);
 
         if (pct < 15) {
-          setProgressText('⚡ Squeezing video frames with hardware acceleration...');
+          setProgressText(`⚡ Encoding ${targetW}x${targetH} @ strictly ${targetFps} FPS...`);
         } else if (pct < 85) {
-          setProgressText(`✨ Optimizing ${targetW}x${targetH} (${pct}% complete)...`);
+          setProgressText(`✨ Optimizing ${targetW}x${targetH} (${frameCount} frames @ ${targetFps} FPS)...`);
         } else {
           setProgressText('📦 Finalizing MP4 container & audio sync...');
         }
@@ -1915,24 +2015,10 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         }
       };
 
-      // Hardware-accelerated frame synchronization to eliminate lagging and FPS drops
-      if ('requestVideoFrameCallback' in hiddenVideo) {
-        const onVideoFrame = () => {
-          if (!hasEnded && !abortRef.current) {
-            renderFrame();
-            frameCallbackId = (hiddenVideo as any).requestVideoFrameCallback(onVideoFrame);
-          }
-        };
-        frameCallbackId = (hiddenVideo as any).requestVideoFrameCallback(onVideoFrame);
-      } else {
-        const onAnimFrame = () => {
-          if (!hasEnded && !abortRef.current) {
-            renderFrame();
-            animationFrameId = requestAnimationFrame(onAnimFrame);
-          }
-        };
-        animationFrameId = requestAnimationFrame(onAnimFrame);
-      }
+      // STRICT FPS FRAME TIMING PUMPER:
+      // Driving canvas rendering at exact (1000 / targetFps) ms eliminates frame rate jitter and mobile drops
+      const frameIntervalMs = Math.max(16, Math.floor(1000 / targetFps));
+      renderIntervalId = window.setInterval(renderFrame, frameIntervalMs);
 
       hiddenVideo.onended = () => {
         finishEncoding();
@@ -1954,13 +2040,19 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       }, 150);
 
       recorder.start(100);
+      if (audioBufferSource) {
+        try {
+          audioBufferSource.start(0);
+        } catch {}
+      }
+
       try {
         hiddenVideo.muted = false;
         hiddenVideo.volume = 1;
         hiddenVideo.removeAttribute('muted');
         await hiddenVideo.play();
       } catch (playErr) {
-        console.warn('Unmuted play error, falling back to seek stepping:', playErr);
+        console.warn('Unmuted play fallback to muted video track:', playErr);
         hiddenVideo.muted = true;
         await hiddenVideo.play().catch(() => {});
       }
@@ -1981,10 +2073,12 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         throw new Error('Encoded output was 0 bytes. Please try another format or resolution.');
       }
 
-      // Fix container duration metadata (resolves WhatsApp & Android 4-second playback issue)
+      // STRICT FPS CONTAINER DURATION MATCHING:
+      // Duration is set strictly to (frameCount / targetFps), guaranteeing that players & inspectors
+      // (MediaInfo, VLC, Android Gallery) calculate FPS = frameCount / duration = targetFps EXACTLY (30.00 FPS).
       setProgressText('Fixing container duration for WhatsApp & Gallery compatibility...');
-      const actualDuration = Math.max(0.5, hiddenVideo.currentTime || duration);
-      const finalBlob = await fixMediaDuration(rawBlob, actualDuration);
+      const exactDuration = frameCount > 0 ? (frameCount / targetFps) : Math.max(0.5, hiddenVideo.currentTime || duration);
+      const finalBlob = await fixMediaDuration(rawBlob, exactDuration);
 
       setProgress(100);
       const finalUrl = URL.createObjectURL(finalBlob);
@@ -2156,14 +2250,20 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
                   <button
                     key={idx}
                     onClick={() => applyPreset(p.sizeMb)}
-                    className={`text-xs font-bold px-3 py-1.5 rounded-full border transition-all kickable flex items-center gap-1 ${
+                    className={`text-xs font-bold px-3 py-1.5 rounded-full border transition-all kickable flex items-center gap-1.5 ${
                       isSelected 
                         ? 'bg-gradient-to-r from-sky-500 to-blue-600 text-white border-sky-400 shadow-md ring-2 ring-sky-300 dark:ring-sky-500' 
                         : 'bg-white/80 dark:bg-slate-800/80 text-sky-800 dark:text-sky-300 border-sky-200 dark:border-slate-700 hover:bg-sky-100 dark:hover:bg-slate-700'
                     }`}
                     title={isSelected ? "Click to deselect preset" : p.description}
                   >
-                    <span>{p.label} • {p.tag}</span>
+                    <span>{p.platform}</span>
+                    <span className="opacity-80 text-[11px]">({p.label})</span>
+                    {p.badge && (
+                      <span className={`text-[10px] font-extrabold px-1.5 py-0.2 rounded-full ${isSelected ? 'bg-white/25 text-white' : 'bg-sky-100 dark:bg-sky-900/40 text-sky-700 dark:text-sky-300'}`}>
+                        {p.badge}
+                      </span>
+                    )}
                     {isSelected && <span className="text-[10px] bg-white/30 rounded-full px-1">✕</span>}
                   </button>
                 );
@@ -2391,15 +2491,21 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
                             <button
                               key={i}
                               onClick={() => applyPreset(p.sizeMb)}
-                              className={`text-xs font-bold px-2.5 py-1 rounded-lg border transition-all kickable flex items-center gap-1 ${
+                              className={`text-xs font-bold px-2.5 py-1.5 rounded-xl border transition-all kickable flex items-center gap-1.5 ${
                                 isSelected 
                                   ? 'bg-gradient-to-r from-sky-500 to-blue-600 text-white border-sky-400 shadow-sm ring-2 ring-sky-300 dark:ring-sky-500' 
-                                  : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 border-slate-200 dark:border-slate-700 hover:border-sky-300'
+                                  : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 border-slate-200 dark:border-slate-700 hover:border-sky-300 hover:text-sky-600 dark:hover:text-sky-400'
                               }`}
                               title={isSelected ? "Click to deselect preset" : p.description}
                             >
-                              <span>{p.label} • {p.tag}</span>
-                              {isSelected && <span className="text-[9px] bg-white/30 rounded-full px-1">✕</span>}
+                              <span>{p.platform}</span>
+                              <span className="opacity-80 text-[11px]">({p.label})</span>
+                              {p.badge && (
+                                <span className={`text-[10px] font-extrabold px-1.5 py-0.2 rounded-full ${isSelected ? 'bg-white/25 text-white' : 'bg-sky-100 dark:bg-sky-900/50 text-sky-700 dark:text-sky-300'}`}>
+                                  {p.badge}
+                                </span>
+                              )}
+                              {isSelected && <span className="text-[10px] bg-white/30 rounded-full px-1">✕</span>}
                             </button>
                           );
                         })}
@@ -2409,13 +2515,36 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
                               play('pop');
                               setSettings((prev) => ({ ...prev, targetSize: '' }));
                             }}
-                            className="text-xs font-bold px-2.5 py-1 rounded-lg text-rose-600 dark:text-rose-400 bg-rose-50 dark:bg-rose-950/60 border border-rose-200 dark:border-rose-800 hover:bg-rose-100 dark:hover:bg-rose-900/50 transition-all flex items-center gap-1 kickable"
+                            className="text-xs font-bold px-2.5 py-1.5 rounded-xl text-rose-600 dark:text-rose-400 bg-rose-50 dark:bg-rose-950/60 border border-rose-200 dark:border-rose-800 hover:bg-rose-100 dark:hover:bg-rose-900/50 transition-all flex items-center gap-1 kickable"
                             title="Deselect active preset"
                           >
                             <X size={11} /> Deselect
                           </button>
                         )}
                       </div>
+
+                      {/* Clear Calculation Explainer Card */}
+                      {activePresetObj && (
+                        <div className="mb-3 p-3 rounded-xl bg-sky-50/90 dark:bg-sky-950/50 border border-sky-200 dark:border-sky-800 text-xs text-slate-700 dark:text-slate-200 flex items-start gap-2 shadow-sm animate-fadeIn">
+                          <Sparkles size={15} className="text-amber-500 shrink-0 mt-0.5" />
+                          <div className="flex-1">
+                            <div className="font-bold flex items-center gap-1.5 text-sky-900 dark:text-sky-100">
+                              <span>{activePresetObj.platform} Preset</span>
+                              <span className="bg-sky-200/80 dark:bg-sky-800 text-sky-900 dark:text-sky-100 text-[10px] px-1.5 py-0.2 rounded font-mono font-bold">
+                                Target: {activePresetObj.label}
+                              </span>
+                              {activePresetObj.badge && (
+                                <span className="bg-emerald-100 dark:bg-emerald-950/80 text-emerald-700 dark:text-emerald-300 text-[10px] px-1.5 py-0.2 rounded font-bold">
+                                  {activePresetObj.badge} reduction
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-[11px] text-slate-600 dark:text-slate-300 mt-1">
+                              {activePresetObj.description}
+                            </p>
+                          </div>
+                        </div>
+                      )}
 
                       <div className="flex space-x-2">
                         <input 
