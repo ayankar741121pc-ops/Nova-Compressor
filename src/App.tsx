@@ -1297,11 +1297,11 @@ interface DynamicPreset {
 const getPresetsForFile = (fileSizeInBytes: number | null): DynamicPreset[] => {
   if (!fileSizeInBytes || fileSizeInBytes <= 0) {
     return [
-      { id: 'wa-16', label: '16 MB', platform: 'WhatsApp Chat', sizeMb: '16', reductionPct: 0, description: 'Universal WhatsApp 16 MB status & chat upload limit', badge: '16 MB' },
-      { id: 'discord-20', label: '19.5 MB', platform: 'Discord Free', sizeMb: '19.5', reductionPct: 0, description: 'Fits Discord 20 MB free upload limit', badge: '19.5 MB' },
-      { id: 'email-25', label: '24 MB', platform: 'Gmail / Email', sizeMb: '24', reductionPct: 0, description: 'Fits Gmail & Outlook 25 MB attachment cap', badge: '24 MB' },
-      { id: 'wa-64', label: '60 MB', platform: 'WhatsApp HD', sizeMb: '60', reductionPct: 0, description: 'WhatsApp HD 64 MB media limit', badge: '60 MB' },
-      { id: 'save-50', label: '50% Cut', platform: 'Half Size', sizeMb: '50', reductionPct: 50, description: 'Halves video file size with crisp clarity', badge: '-50%' }
+      { id: 'wa-16', label: '16 MB limit', platform: 'WhatsApp', sizeMb: '16', reductionPct: 0, description: 'Universal WhatsApp 16 MB status & chat upload limit', badge: 'Chat' },
+      { id: 'discord-20', label: '20 MB limit', platform: 'Discord', sizeMb: '19.5', reductionPct: 0, description: 'Fits Discord 20 MB free upload limit', badge: 'Free' },
+      { id: 'email-25', label: '25 MB limit', platform: 'Gmail', sizeMb: '24', reductionPct: 0, description: 'Fits Gmail & Outlook 25 MB attachment cap', badge: 'Email' },
+      { id: 'wa-64', label: '64 MB limit', platform: 'WhatsApp HD', sizeMb: '60', reductionPct: 0, description: 'WhatsApp HD 64 MB media limit', badge: 'HD' },
+      { id: 'save-50', label: 'Half Size', platform: '50% Cut', sizeMb: '50', reductionPct: 50, description: 'Halves video file size with crisp clarity', badge: '-50%' }
     ];
   }
 
