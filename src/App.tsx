@@ -437,70 +437,104 @@ interface VideoFileInfo {
 
 const parseVideoFileHeader = async (file: File): Promise<VideoFileInfo> => {
   try {
-    const slice = await file.slice(0, Math.min(file.size, 512 * 1024)).arrayBuffer();
-    const u8 = new Uint8Array(slice);
-    const view = new DataView(slice);
+    // 1. Read head slice (first 2MB to catch moov and trak)
+    const headSlice = await file.slice(0, Math.min(file.size, 2 * 1024 * 1024)).arrayBuffer();
+    let u8 = new Uint8Array(headSlice);
+    let view = new DataView(headSlice);
 
     let fps = 30;
-    let hasAudio = true; // Default to true so mobile recordings are never stripped of audio
+    let hasAudio = true; // Default true so phone recordings preserve audio
+    let foundFps = false;
 
-    // Check if MP4 / QuickTime (has 'ftyp' or 'moov')
-    const hasMoov = findSequence(u8, [0x6d, 0x6f, 0x6f, 0x76]) !== -1;
+    // Check if moov is present in head
+    let hasMoov = findSequence(u8, [0x6d, 0x6f, 0x6f, 0x76]) !== -1;
     const hasFtyp = findSequence(u8, [0x66, 0x74, 0x79, 0x70]) !== -1;
 
+    // If MP4/MOV and moov is NOT in the first 2MB, check the last 4MB (phone recordings put moov at the tail!)
+    if ((hasFtyp || file.name.match(/\.(mp4|mov|m4v)$/i)) && !hasMoov && file.size > 2 * 1024 * 1024) {
+      try {
+        const tailSlice = await file.slice(Math.max(0, file.size - 4 * 1024 * 1024), file.size).arrayBuffer();
+        const tailU8 = new Uint8Array(tailSlice);
+        if (findSequence(tailU8, [0x6d, 0x6f, 0x6f, 0x76]) !== -1) {
+          u8 = tailU8;
+          view = new DataView(tailSlice);
+          hasMoov = true;
+        }
+      } catch {}
+    }
+
     if (hasMoov || hasFtyp) {
-      // Check for audio handler 'soun' in head or tail
       if (findSequence(u8, [0x73, 0x6f, 0x75, 0x6e]) !== -1) {
         hasAudio = true;
-      } else if (file.size > 512 * 1024) {
-        try {
-          const tailSlice = await file.slice(Math.max(0, file.size - 512 * 1024), file.size).arrayBuffer();
-          const tailU8 = new Uint8Array(tailSlice);
-          if (findSequence(tailU8, [0x73, 0x6f, 0x75, 0x6e]) !== -1) {
-            hasAudio = true;
-          }
-        } catch {}
       }
 
-      // Check timescale from mdhd
-      let timescale = 0;
-      const mdhdPos = findSequence(u8, [0x6d, 0x64, 0x68, 0x64]);
-      if (mdhdPos !== -1) {
-        const version = u8[mdhdPos + 4];
-        timescale = view.getUint32(mdhdPos + (version === 0 ? 16 : 24));
-      }
-
-      // Check stts (time-to-sample)
-      const sttsPos = findSequence(u8, [0x73, 0x74, 0x74, 0x73]);
-      if (sttsPos !== -1 && timescale > 0) {
-        const entryCount = view.getUint32(sttsPos + 8);
-        if (entryCount > 0) {
-          const sampleDelta = view.getUint32(sttsPos + 16);
-          if (sampleDelta > 0) {
-            const calcFps = timescale / sampleDelta;
-            if (calcFps >= 10 && calcFps <= 120) {
-              fps = Math.round(calcFps);
+      // Parse video trak specifically
+      let videoTimescale = 0;
+      let trakPos = 0;
+      while ((trakPos = findSequence(u8, [0x74, 0x72, 0x61, 0x6b], trakPos)) !== -1) {
+        const trakEnd = Math.min(u8.length, trakPos + 16000);
+        const trakSlice = u8.subarray(trakPos, trakEnd);
+        const isVide = findSequence(trakSlice, [0x76, 0x69, 0x64, 0x65]) !== -1;
+        if (isVide) {
+          const mdhdPos = findSequence(trakSlice, [0x6d, 0x64, 0x68, 0x64]);
+          if (mdhdPos !== -1) {
+            const globalMdhd = trakPos + mdhdPos;
+            const ver = u8[globalMdhd + 4];
+            const tsOffset = globalMdhd + (ver === 0 ? 16 : 24);
+            if (tsOffset + 4 <= u8.length) {
+              videoTimescale = view.getUint32(tsOffset);
             }
           }
+
+          // Check stts (time-to-sample) inside this video trak
+          const sttsPos = findSequence(trakSlice, [0x73, 0x74, 0x74, 0x73]);
+          if (sttsPos !== -1 && videoTimescale > 0) {
+            const globalStts = trakPos + sttsPos;
+            const entryCount = view.getUint32(globalStts + 8);
+            if (entryCount > 0) {
+              let totalSamples = 0;
+              let totalDur = 0;
+              const entriesToRead = Math.min(entryCount, 32);
+              for (let e = 0; e < entriesToRead; e++) {
+                const entryOff = globalStts + 12 + e * 8;
+                if (entryOff + 8 <= u8.length) {
+                  const sCount = view.getUint32(entryOff);
+                  const sDelta = view.getUint32(entryOff + 4);
+                  totalSamples += sCount;
+                  totalDur += sCount * sDelta;
+                }
+              }
+              if (totalDur > 0 && totalSamples > 0) {
+                const calcFps = (videoTimescale * totalSamples) / totalDur;
+                if (calcFps >= 10 && calcFps <= 144) {
+                  fps = Math.round(calcFps);
+                  foundFps = true;
+                }
+              }
+            }
+          }
+          break;
         }
+        trakPos += 4;
       }
 
-      // Check trun (fragmented track run) if stts was empty
-      if (fps === 30 && timescale > 0) {
+      // If stts was 0 or not found (e.g. fragmented MP4 / fMP4), check trun
+      if (!foundFps && videoTimescale > 0) {
         const trunPos = findSequence(u8, [0x74, 0x72, 0x75, 0x6e]);
         if (trunPos !== -1) {
           const flags = (u8[trunPos + 5] << 16) | (u8[trunPos + 6] << 8) | u8[trunPos + 7];
           const hasDur = (flags & 0x000100) !== 0;
           if (hasDur) {
             let offset = trunPos + 12;
-            if ((flags & 0x000001) !== 0) offset += 4; // data-offset
-            if ((flags & 0x000004) !== 0) offset += 4; // first-sample-flags
+            if ((flags & 0x000001) !== 0) offset += 4;
+            if ((flags & 0x000004) !== 0) offset += 4;
             if (offset + 4 <= u8.length) {
               const sampleDur = view.getUint32(offset);
               if (sampleDur > 0) {
-                const calcFps = timescale / sampleDur;
-                if (calcFps >= 10 && calcFps <= 120) {
+                const calcFps = videoTimescale / sampleDur;
+                if (calcFps >= 10 && calcFps <= 144) {
                   fps = Math.round(calcFps);
+                  foundFps = true;
                 }
               }
             }
@@ -508,7 +542,7 @@ const parseVideoFileHeader = async (file: File): Promise<VideoFileInfo> => {
         }
       }
 
-      return { fps, hasAudio, timescale };
+      return { fps, hasAudio, timescale: videoTimescale };
     }
 
     // Check WebM
@@ -523,7 +557,7 @@ const parseVideoFileHeader = async (file: File): Promise<VideoFileInfo> => {
           const ns = view.getUint32(durPos + 4);
           if (ns > 0) {
             const calcFps = 1e9 / ns;
-            if (calcFps >= 10 && calcFps <= 120) fps = Math.round(calcFps);
+            if (calcFps >= 10 && calcFps <= 144) fps = Math.round(calcFps);
           }
         }
       }
@@ -1473,10 +1507,13 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
     const options = [
       { value: 'keep', label: `Original Frame Rate (${detectedFps} FPS)` }
     ];
-    if (detectedFps >= 50) {
+    if (detectedFps !== 60 && detectedFps !== 30 && detectedFps !== 24 && detectedFps >= 15) {
+      options.push({ value: String(detectedFps), label: `${detectedFps} FPS (Match Source)` });
+    }
+    if (detectedFps >= 45) {
       options.push({ value: '60', label: '60 FPS (Ultra Smooth)' });
     }
-    if (detectedFps >= 28) {
+    if (detectedFps >= 26) {
       options.push({ value: '30', label: '30 FPS (Standard Web & Mobile)' });
     }
     options.push({ value: '24', label: '24 FPS (Fast Chat / WhatsApp)' });
@@ -1787,11 +1824,12 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       }
 
       const { mimeType, baseMime, ext } = getSupportedVideoConfig(settings.outputFormat, includeAudio);
+      const detectedSourceFps = metadata.fps ? Math.round(metadata.fps) : 30;
       const targetFps = settings.frameRate !== 'keep' 
         ? parseInt(settings.frameRate, 10) || 30 
-        : Math.min(60, Math.max(24, Math.round(metadata.fps || 30)));
+        : Math.min(120, Math.max(15, detectedSourceFps));
 
-      setProgress(5);
+      setProgress(6);
       setProgressText(`Warming up ${targetW}x${targetH} @ ${targetFps} FPS engine...`);
 
       const hiddenVideo = document.createElement('video');
@@ -1809,14 +1847,15 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       hiddenVideo.volume = 0;
       hiddenVideo.setAttribute('muted', '');
 
+      // CRITICAL FOR MOBILE: Give element real dimensions in viewport behind opaque UI.
+      // Do NOT set 2px width or 0.01 opacity, which triggers Android Chromium power-saver throttling (10-14 FPS or 0 FPS stall).
       hiddenVideo.style.position = 'fixed';
-      hiddenVideo.style.bottom = '0px';
-      hiddenVideo.style.right = '0px';
-      hiddenVideo.style.width = '2px';
-      hiddenVideo.style.height = '2px';
-      hiddenVideo.style.opacity = '0.01';
-      hiddenVideo.style.pointerEvents = 'none';
+      hiddenVideo.style.top = '0px';
+      hiddenVideo.style.left = '0px';
+      hiddenVideo.style.width = '320px';
+      hiddenVideo.style.height = '240px';
       hiddenVideo.style.zIndex = '-999';
+      hiddenVideo.style.pointerEvents = 'none';
       document.body.appendChild(hiddenVideo);
 
       await new Promise<void>((resolve) => {
@@ -1839,7 +1878,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
             isDone = true;
             resolve();
           }
-        }, 2500);
+        }, 1500);
         hiddenVideo.load();
       });
 
@@ -1980,7 +2019,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         }
       };
 
-      const renderFrame = () => {
+      const renderCurrentFrame = () => {
         if (hasEnded || abortRef.current) return;
         
         ctx.drawImage(hiddenVideo, 0, 0, targetW, targetH);
@@ -2014,8 +2053,17 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
           lastTime = currentT;
         }
 
-        if (hiddenVideo.currentTime >= effectiveDuration - 0.08) {
+        if (hiddenVideo.currentTime >= effectiveDuration - 0.08 || hiddenVideo.ended) {
           finishEncoding();
+        }
+      };
+
+      // Primary frame driver: requestVideoFrameCallback for perfectly synchronized, zero-drop frame capture!
+      const pumpFrame = () => {
+        if (hasEnded || abortRef.current) return;
+        renderCurrentFrame();
+        if ('requestVideoFrameCallback' in hiddenVideo && !hiddenVideo.ended && !hasEnded) {
+          frameCallbackId = (hiddenVideo as any).requestVideoFrameCallback(pumpFrame);
         }
       };
 
@@ -2037,20 +2085,39 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         }
       }, 250);
 
-      // CRITICAL: Start hiddenVideo playback FIRST so frames are flowing BEFORE starting capture interval
-      try {
-        await hiddenVideo.play();
-      } catch (playErr) {
-        console.warn('Play error, forcing muted fallback:', playErr);
-        hiddenVideo.muted = true;
-        hiddenVideo.volume = 0;
-        await hiddenVideo.play().catch(() => {});
+      // Pause preview player to free up Android hardware decoder session
+      if (videoRef.current) {
+        try {
+          videoRef.current.pause();
+        } catch {}
       }
 
-      // ONLY start recorder and frame pumper AFTER hiddenVideo is actively playing:
+      // Safe playback start: race with 600ms timeout so progress never freezes at 5% on Android
+      const playPromise = hiddenVideo.play().catch(async (playErr) => {
+        console.warn('Playback error, retrying muted:', playErr);
+        hiddenVideo.muted = true;
+        hiddenVideo.volume = 0;
+        return hiddenVideo.play().catch(() => {});
+      });
+
+      await Promise.race([
+        playPromise,
+        new Promise((r) => setTimeout(r, 600))
+      ]);
+
+      // Start recorder and frame engines:
       recorder.start(100);
+
+      if ('requestVideoFrameCallback' in hiddenVideo) {
+        frameCallbackId = (hiddenVideo as any).requestVideoFrameCallback(pumpFrame);
+      }
+
       const frameIntervalMs = Math.max(16, Math.floor(1000 / targetFps));
-      renderIntervalId = window.setInterval(renderFrame, frameIntervalMs);
+      renderIntervalId = window.setInterval(() => {
+        if (!('requestVideoFrameCallback' in hiddenVideo)) {
+          renderCurrentFrame();
+        }
+      }, frameIntervalMs);
 
       const rawBlob = await encodedBlobPromise;
       finishEncoding();
@@ -2069,7 +2136,11 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       }
 
       setProgressText('Fixing container duration for WhatsApp & Gallery compatibility...');
-      const exactDuration = frameCount > 0 ? (frameCount / targetFps) : Math.max(0.5, hiddenVideo.currentTime || duration);
+      // CRITICAL: NEVER calculate duration from (frameCount / targetFps)!
+      // The true video duration must always be used so the container is never truncated to 4 seconds!
+      const exactDuration = Number.isFinite(hiddenVideo.duration) && hiddenVideo.duration > 0.1 
+        ? hiddenVideo.duration 
+        : (duration > 0.1 ? duration : 10);
       const finalBlob = await fixMediaDuration(rawBlob, exactDuration);
 
       setProgress(100);
@@ -2324,15 +2395,43 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
                       className="w-full h-full object-contain" 
                       controls={!isProcessing}
                       onLoadedMetadata={(e) => {
-                        const d = e.currentTarget.duration;
-                        const w = e.currentTarget.videoWidth;
-                        const h = e.currentTarget.videoHeight;
+                        const v = e.currentTarget;
+                        const d = v.duration;
+                        const w = v.videoWidth;
+                        const h = v.videoHeight;
                         setMetadata((prev) => ({
                           ...prev,
                           duration: Number.isFinite(d) && d > 0 ? d : 10,
                           width: w > 0 ? w : 1280,
                           height: h > 0 ? h : 720
                         }));
+
+                        // Secondary dynamic probe: detect exact presentation FPS when frames play
+                        if ('requestVideoFrameCallback' in v) {
+                          let lastT = -1;
+                          const samples: number[] = [];
+                          const probe = (_now: number, metadata: any) => {
+                            if (metadata && typeof metadata.mediaTime === 'number') {
+                              if (lastT >= 0) {
+                                const dt = metadata.mediaTime - lastT;
+                                if (dt > 0.005 && dt < 0.1) samples.push(dt);
+                              }
+                              lastT = metadata.mediaTime;
+                            }
+                            if (samples.length >= 3) {
+                              const avgDt = samples.reduce((a, b) => a + b, 0) / samples.length;
+                              if (avgDt > 0.005) {
+                                const detected = Math.round(1 / avgDt);
+                                if (detected >= 12 && detected <= 144) {
+                                  setMetadata((prev) => ({ ...prev, fps: detected }));
+                                }
+                              }
+                            } else if (!v.paused) {
+                              (v as any).requestVideoFrameCallback(probe);
+                            }
+                          };
+                          (v as any).requestVideoFrameCallback(probe);
+                        }
                       }}
                     />
                   ) : (
