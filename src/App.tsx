@@ -1535,6 +1535,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
   const abortRef = useRef(false);
   const activeRecorderRef = useRef<MediaRecorder | null>(null);
   const activeVideoElRef = useRef<HTMLVideoElement | null>(null);
+  const activeAudioCtxRef = useRef<AudioContext | null>(null);
 
   const applyPreset = (targetMb: string) => {
     setSettings((prev) => {
@@ -1616,8 +1617,26 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       } catch {}
     }
     if (activeVideoElRef.current) {
-      activeVideoElRef.current.pause();
-      activeVideoElRef.current.src = '';
+      try {
+        activeVideoElRef.current.pause();
+        activeVideoElRef.current.muted = true;
+        activeVideoElRef.current.volume = 0;
+        activeVideoElRef.current.src = '';
+        if (activeVideoElRef.current.parentNode) {
+          activeVideoElRef.current.parentNode.removeChild(activeVideoElRef.current);
+        }
+      } catch {}
+    }
+    if (videoRef.current) {
+      try {
+        videoRef.current.pause();
+      } catch {}
+    }
+    if (activeAudioCtxRef.current) {
+      try {
+        activeAudioCtxRef.current.close();
+      } catch {}
+      activeAudioCtxRef.current = null;
     }
     setIsProcessing(false);
     setProgress(0);
@@ -1629,19 +1648,27 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
     play('kick');
     setIsProcessing(true);
     abortRef.current = false;
-    setProgress(0);
-    setProgressText('Warming up browser hardware encoder...');
+    setProgress(3);
+    setProgressText('Initializing hardware video encoder...');
     setTargetMessage(null);
     setErrorMessage(null);
 
+    // Mute and pause the UI preview player so its sound never plays while compressing
+    if (videoRef.current) {
+      try {
+        videoRef.current.pause();
+        videoRef.current.muted = true;
+      } catch {}
+    }
+
     // CRITICAL FOR ANDROID CHROME & MOBILE WEBVIEW:
     // AudioContext MUST be created and resumed synchronously within the immediate user click gesture.
-    // If deferred past any `await`, Android Chrome rejects AudioContext.resume() and suspends all audio.
     const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
     let audioCtx: AudioContext | null = null;
     if (AudioContextClass) {
       try {
         audioCtx = new AudioContextClass();
+        activeAudioCtxRef.current = audioCtx;
         if (audioCtx.state === 'suspended') {
           audioCtx.resume().catch(() => {});
         }
@@ -1685,6 +1712,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
 
         const wavBlob = encodeAudioBufferToWav(decodedBuffer, sampleRate);
         await actx.close().catch(() => {});
+        activeAudioCtxRef.current = null;
 
         setProgress(100);
         const outUrl = URL.createObjectURL(wavBlob);
@@ -1727,7 +1755,6 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       const targetMb = settings.targetSize ? parseFloat(settings.targetSize) : null;
       let videoBps = 2500000;
 
-      // Quality & Speed headroom (Studio mode uses 0.96 for maximum quality fidelity)
       const headroom = settings.encodingSpeed === 'studio' 
         ? 0.96 
         : settings.encodingSpeed === 'balanced' 
@@ -1740,12 +1767,10 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         const totalBps = totalBits / duration;
         
         if (file.size <= targetBytes) {
-          // File is already under target MB! Do not overcompress or crush quality!
           const originalBps = (file.size * 8) / duration;
           const preserveRatio = settings.encodingSpeed === 'studio' ? 0.98 : settings.encodingSpeed === 'balanced' ? 0.92 : 0.85;
           videoBps = Math.max(120000, Math.floor((originalBps - audioBps) * preserveRatio));
         } else {
-          // File is larger than target: target exact MB with speed-appropriate headroom
           videoBps = Math.max(80000, Math.floor((totalBps - audioBps) * headroom));
         }
       } else if (settings.bitrateMode === 'custom') {
@@ -1766,7 +1791,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         ? parseInt(settings.frameRate, 10) || 30 
         : Math.min(60, Math.max(24, Math.round(metadata.fps || 30)));
 
-      setProgress(2);
+      setProgress(5);
       setProgressText(`Warming up ${targetW}x${targetH} @ ${targetFps} FPS engine...`);
 
       const hiddenVideo = document.createElement('video');
@@ -1778,8 +1803,12 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       hiddenVideo.setAttribute('webkit-playsinline', '');
       hiddenVideo.crossOrigin = 'anonymous';
       hiddenVideo.preload = 'auto';
+      // START MUTED AND ZERO VOLUME:
+      hiddenVideo.muted = true;
+      hiddenVideo.defaultMuted = true;
+      hiddenVideo.volume = 0;
+      hiddenVideo.setAttribute('muted', '');
 
-      // Keep within visible viewport at 2x2px opacity 0.01 to prevent Android background throttling
       hiddenVideo.style.position = 'fixed';
       hiddenVideo.style.bottom = '0px';
       hiddenVideo.style.right = '0px';
@@ -1807,7 +1836,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
             reject(new Error('Failed to load input video for encoding.'));
           }
         };
-        setTimeout(onReady, 1500);
+        setTimeout(onReady, 1000);
         hiddenVideo.load();
       });
 
@@ -1826,62 +1855,36 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       const canvasStream = canvas.captureStream(targetFps);
       const combinedTracks: MediaStreamTrack[] = [...canvasStream.getVideoTracks()];
 
-      // ANDROID & UNIVERSAL AUDIO ENGINE (3-TIER BULLETPROOF)
-      let audioBufferSource: AudioBufferSourceNode | null = null;
+      // AUDIO ROUTING ENGINE: 100% SILENT THROUGH SPEAKERS, 100% CAPTURED INTO VIDEO
       let audioTrackAdded = false;
 
-      if (includeAudio && audioCtx && metadata.hasAudio !== false) {
+      if (includeAudio) {
         try {
-          if (audioCtx.state === 'suspended') {
-            await audioCtx.resume().catch(() => {});
-          }
-
-          // TIER 1: Native Web Audio Decode Directly From File (Never muted, completely immune to mobile autoplay blocks)
-          const fileBuf = await file.arrayBuffer();
-          const decodedAudio = await audioCtx.decodeAudioData(fileBuf.slice(0));
-          
-          if (decodedAudio && decodedAudio.numberOfChannels > 0 && decodedAudio.length > 0) {
-            const destNode = audioCtx.createMediaStreamDestination();
-            const bSource = audioCtx.createBufferSource();
-            bSource.buffer = decodedAudio;
-            
-            // Connect to recorder stream destination
-            bSource.connect(destNode);
-            
-            // Connect to silent keep-alive tap to ensure hardware audio clock keeps rendering on Android
-            const zeroGain = audioCtx.createGain();
-            zeroGain.gain.value = 0.00001; // -100 dB (inaudible)
-            bSource.connect(zeroGain);
-            zeroGain.connect(audioCtx.destination);
-            
-            const destTracks = destNode.stream.getAudioTracks();
-            if (destTracks.length > 0) {
-              destTracks[0].enabled = true;
-              combinedTracks.push(destTracks[0]);
-              audioBufferSource = bSource;
-              audioTrackAdded = true;
+          if (audioCtx) {
+            if (audioCtx.state === 'suspended') {
+              await audioCtx.resume().catch(() => {});
             }
-          }
-        } catch (audioDecodeErr) {
-          console.warn('Tier 1 audio decode fallback:', audioDecodeErr);
-        }
 
-        // TIER 2: Fallback to HTMLMediaElement source
-        if (!audioTrackAdded && audioCtx) {
-          try {
+            // createMediaElementSource disconnects the video's audio from default speakers completely!
+            const sourceNode = audioCtx.createMediaElementSource(hiddenVideo);
+            const destNode = audioCtx.createMediaStreamDestination();
+            sourceNode.connect(destNode);
+
+            // CRITICAL: We NEVER connect sourceNode or destNode to audioCtx.destination!
+            // This guarantees ZERO audio is ever played through phone or PC speakers.
+            
+            // Now unmute hiddenVideo: all audio flows into destNode.stream, ZERO into speakers!
             hiddenVideo.muted = false;
             hiddenVideo.defaultMuted = false;
             hiddenVideo.volume = 1;
             hiddenVideo.removeAttribute('muted');
 
-            const sourceNode = audioCtx.createMediaElementSource(hiddenVideo);
-            const destNode = audioCtx.createMediaStreamDestination();
-            sourceNode.connect(destNode);
-
-            const zeroGain = audioCtx.createGain();
-            zeroGain.gain.value = 0.00001;
-            sourceNode.connect(zeroGain);
-            zeroGain.connect(audioCtx.destination);
+            // Attach dummy silent audio sink to keep mobile audio rendering pipeline active
+            const dummyAudio = document.createElement('audio');
+            dummyAudio.srcObject = destNode.stream;
+            dummyAudio.muted = true;
+            dummyAudio.volume = 0;
+            dummyAudio.play().catch(() => {});
 
             const capturedAudioTracks = destNode.stream.getAudioTracks();
             if (capturedAudioTracks.length > 0) {
@@ -1889,17 +1892,16 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
               combinedTracks.push(capturedAudioTracks[0]);
               audioTrackAdded = true;
             }
-          } catch (err) {
-            console.warn('Tier 2 MediaElementSource fallback:', err);
           }
+        } catch (err) {
+          console.warn('Web Audio capture setup error:', err);
+          hiddenVideo.muted = true;
+          hiddenVideo.volume = 0;
         }
 
-        // TIER 3: Direct captureStream fallback
+        // Direct captureStream fallback
         if (!audioTrackAdded) {
           try {
-            hiddenVideo.muted = false;
-            hiddenVideo.volume = 1;
-            hiddenVideo.removeAttribute('muted');
             const directStream = (hiddenVideo as any).captureStream ? (hiddenVideo as any).captureStream() : (hiddenVideo as any).mozCaptureStream ? (hiddenVideo as any).mozCaptureStream() : null;
             if (directStream) {
               const directTracks = directStream.getAudioTracks();
@@ -1909,7 +1911,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
               }
             }
           } catch (e) {
-            console.warn('Tier 3 captureStream fallback:', e);
+            console.warn('Direct stream fallback error:', e);
           }
         }
       }
@@ -1963,15 +1965,10 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         if (animationFrameId !== null) {
           cancelAnimationFrame(animationFrameId);
         }
-        if (audioBufferSource) {
-          try {
-            audioBufferSource.stop();
-          } catch {}
-          audioBufferSource = null;
-        }
         if (audioCtx) {
           audioCtx.close().catch(() => {});
           audioCtx = null;
+          activeAudioCtxRef.current = null;
         }
         if (recorder.state !== 'inactive') {
           try {
@@ -1986,8 +1983,12 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         ctx.drawImage(hiddenVideo, 0, 0, targetW, targetH);
         frameCount++;
 
+        if (Number.isFinite(hiddenVideo.duration) && hiddenVideo.duration > 0.1) {
+          duration = hiddenVideo.duration;
+        }
+        const effectiveDuration = Number.isFinite(duration) && duration > 0.5 ? duration : 10;
         const currentT = hiddenVideo.currentTime;
-        const pct = Math.min(99, Math.max(2, Math.round((currentT / duration) * 100)));
+        const pct = Math.min(99, Math.max(5, Math.round((currentT / effectiveDuration) * 100)));
         setProgress(pct);
 
         if (pct < 15) {
@@ -2003,20 +2004,18 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
           stallCount++;
           if (stallCount >= 3) {
             hiddenVideo.play().catch(() => {});
-            hiddenVideo.currentTime = Math.min(duration, hiddenVideo.currentTime + (1 / targetFps));
+            hiddenVideo.currentTime = Math.min(effectiveDuration, hiddenVideo.currentTime + (1 / targetFps));
           }
         } else {
           stallCount = 0;
           lastTime = currentT;
         }
 
-        if (hiddenVideo.currentTime >= duration - 0.08) {
+        if (hiddenVideo.currentTime >= effectiveDuration - 0.08) {
           finishEncoding();
         }
       };
 
-      // STRICT FPS FRAME TIMING PUMPER:
-      // Driving canvas rendering at exact (1000 / targetFps) ms eliminates frame rate jitter and mobile drops
       const frameIntervalMs = Math.max(16, Math.floor(1000 / targetFps));
       renderIntervalId = window.setInterval(renderFrame, frameIntervalMs);
 
@@ -2024,7 +2023,6 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         finishEncoding();
       };
 
-      // Watchdog: ensures video does not stall on Android or stop prematurely
       watchdogTimer = window.setInterval(() => {
         if (abortRef.current) {
           finishEncoding();
@@ -2034,26 +2032,20 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
           hiddenVideo.play().catch(() => {});
           renderFrame();
         }
-        if (hiddenVideo.currentTime >= duration - 0.08) {
+        const effectiveDuration = Number.isFinite(duration) && duration > 0.5 ? duration : 10;
+        if (hiddenVideo.currentTime >= effectiveDuration - 0.08) {
           finishEncoding();
         }
       }, 150);
 
       recorder.start(100);
-      if (audioBufferSource) {
-        try {
-          audioBufferSource.start(0);
-        } catch {}
-      }
 
       try {
-        hiddenVideo.muted = false;
-        hiddenVideo.volume = 1;
-        hiddenVideo.removeAttribute('muted');
         await hiddenVideo.play();
       } catch (playErr) {
-        console.warn('Unmuted play fallback to muted video track:', playErr);
+        console.warn('Play error, forcing muted fallback:', playErr);
         hiddenVideo.muted = true;
+        hiddenVideo.volume = 0;
         await hiddenVideo.play().catch(() => {});
       }
 
@@ -2073,9 +2065,6 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         throw new Error('Encoded output was 0 bytes. Please try another format or resolution.');
       }
 
-      // STRICT FPS CONTAINER DURATION MATCHING:
-      // Duration is set strictly to (frameCount / targetFps), guaranteeing that players & inspectors
-      // (MediaInfo, VLC, Android Gallery) calculate FPS = frameCount / duration = targetFps EXACTLY (30.00 FPS).
       setProgressText('Fixing container duration for WhatsApp & Gallery compatibility...');
       const exactDuration = frameCount > 0 ? (frameCount / targetFps) : Math.max(0.5, hiddenVideo.currentTime || duration);
       const finalBlob = await fixMediaDuration(rawBlob, exactDuration);
@@ -2112,10 +2101,21 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
           : 'A critical error occurred while encoding this media file.'
       );
     } finally {
-      if (activeVideoElRef.current && activeVideoElRef.current.parentNode) {
+      if (activeVideoElRef.current) {
         try {
-          activeVideoElRef.current.parentNode.removeChild(activeVideoElRef.current);
+          activeVideoElRef.current.pause();
+          activeVideoElRef.current.muted = true;
+          activeVideoElRef.current.volume = 0;
+          if (activeVideoElRef.current.parentNode) {
+            activeVideoElRef.current.parentNode.removeChild(activeVideoElRef.current);
+          }
         } catch {}
+      }
+      if (activeAudioCtxRef.current) {
+        try {
+          activeAudioCtxRef.current.close();
+        } catch {}
+        activeAudioCtxRef.current = null;
       }
       if (!abortRef.current) {
         setIsProcessing(false);
