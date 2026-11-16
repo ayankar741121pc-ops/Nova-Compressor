@@ -1342,7 +1342,10 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       }
 
       // MODE 2: REAL HARDWARE VIDEO COMPRESSION & TRANSCODING
-      const duration = Math.max(0.5, metadata.duration || 10);
+      // Sanitize duration for Android / mobile camera files (handles Infinity, NaN, 0)
+      let duration = Number.isFinite(metadata.duration) && metadata.duration > 0.1 
+        ? metadata.duration 
+        : 10;
       let targetW = metadata.width || 1280;
       let targetH = metadata.height || 720;
 
@@ -1390,32 +1393,57 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         ? 24 
         : 30;
 
-      setProgressText(
-        `Optimizing ${targetW}x${targetH} @ ${targetFps} FPS (${Math.round(videoBps / 1000)} kbps)...`
-      );
+      setProgress(2);
+      setProgressText(`Warming up ${targetW}x${targetH} @ ${targetFps} FPS engine...`);
 
       const hiddenVideo = document.createElement('video');
       activeVideoElRef.current = hiddenVideo;
       hiddenVideo.src = URL.createObjectURL(file);
       hiddenVideo.playsInline = true;
-      hiddenVideo.muted = !includeAudio;
+      hiddenVideo.muted = true;
+      hiddenVideo.defaultMuted = true;
+      hiddenVideo.volume = 0;
+      hiddenVideo.setAttribute('muted', '');
+      hiddenVideo.setAttribute('playsinline', '');
+      hiddenVideo.setAttribute('webkit-playsinline', '');
       hiddenVideo.crossOrigin = 'anonymous';
       hiddenVideo.preload = 'auto';
 
-      // Attach offscreen in DOM so mobile browsers won't pause playback after 3s
+      // Attach offscreen in DOM so mobile browsers won't pause playback
       hiddenVideo.style.position = 'fixed';
       hiddenVideo.style.top = '-9999px';
       hiddenVideo.style.left = '-9999px';
-      hiddenVideo.style.width = '2px';
-      hiddenVideo.style.height = '2px';
+      hiddenVideo.style.width = '4px';
+      hiddenVideo.style.height = '4px';
       hiddenVideo.style.opacity = '0.01';
       hiddenVideo.style.pointerEvents = 'none';
       document.body.appendChild(hiddenVideo);
 
       await new Promise<void>((resolve, reject) => {
-        hiddenVideo.onloadeddata = () => resolve();
-        hiddenVideo.onerror = () => reject(new Error('Failed to load input video for encoding.'));
+        let isDone = false;
+        const onReady = () => {
+          if (!isDone) {
+            isDone = true;
+            resolve();
+          }
+        };
+        hiddenVideo.onloadeddata = onReady;
+        hiddenVideo.oncanplay = onReady;
+        hiddenVideo.onloadedmetadata = onReady;
+        hiddenVideo.onerror = () => {
+          if (!isDone) {
+            isDone = true;
+            reject(new Error('Failed to load input video for encoding.'));
+          }
+        };
+        // 1.5s safety timeout so mobile devices never hang on loadeddata
+        setTimeout(onReady, 1500);
+        hiddenVideo.load();
       });
+
+      if (Number.isFinite(hiddenVideo.duration) && hiddenVideo.duration > 0.1) {
+        duration = hiddenVideo.duration;
+      }
 
       const canvas = document.createElement('canvas');
       canvas.width = targetW;
@@ -1429,23 +1457,32 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       const combinedTracks: MediaStreamTrack[] = [...canvasStream.getVideoTracks()];
 
       let audioCtx: AudioContext | null = null;
+      let audioSourceNode: AudioBufferSourceNode | null = null;
       if (includeAudio) {
         try {
           const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-          audioCtx = new AudioContextClass();
-          await audioCtx.resume();
-          const sourceNode = audioCtx.createMediaElementSource(hiddenVideo);
-          const destNode = audioCtx.createMediaStreamDestination();
-          sourceNode.connect(destNode);
-          const audioTracks = destNode.stream.getAudioTracks();
-          if (audioTracks.length > 0) {
-            combinedTracks.push(audioTracks[0]);
+          if (AudioContextClass) {
+            audioCtx = new AudioContextClass();
+            if (audioCtx.state === 'suspended') {
+              await audioCtx.resume().catch(() => {});
+            }
+            // Decode audio directly from file bytes in hardware
+            const fileSlice = await file.slice(0, Math.min(file.size, 100 * 1024 * 1024)).arrayBuffer();
+            const decodedAudio = await audioCtx.decodeAudioData(fileSlice).catch(() => null);
+            if (decodedAudio) {
+              audioSourceNode = audioCtx.createBufferSource();
+              audioSourceNode.buffer = decodedAudio;
+              const destNode = audioCtx.createMediaStreamDestination();
+              audioSourceNode.connect(destNode);
+              const audioTrack = destNode.stream.getAudioTracks()[0];
+              if (audioTrack) {
+                combinedTracks.push(audioTrack);
+              }
+            }
           }
-        } catch {
-          hiddenVideo.muted = true;
+        } catch (err) {
+          console.warn('Audio decoding fallback:', err);
         }
-      } else {
-        hiddenVideo.muted = true;
       }
 
       const outputStream = new MediaStream(combinedTracks);
@@ -1479,6 +1516,8 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       let frameCallbackId: number | null = null;
       let animationFrameId: number | null = null;
       let watchdogTimer: number | null = null;
+      let lastTime = -1;
+      let stallCount = 0;
 
       const finishEncoding = () => {
         if (hasEnded) return;
@@ -1500,11 +1539,35 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       };
 
       const renderFrame = () => {
-        if (!hasEnded && !hiddenVideo.paused && !hiddenVideo.ended) {
-          ctx.drawImage(hiddenVideo, 0, 0, targetW, targetH);
-          const currentT = hiddenVideo.currentTime;
-          const pct = Math.min(99, Math.round((currentT / duration) * 100));
-          setProgress(pct);
+        if (hasEnded || abortRef.current) return;
+        
+        ctx.drawImage(hiddenVideo, 0, 0, targetW, targetH);
+        const currentT = hiddenVideo.currentTime;
+        const pct = Math.min(99, Math.max(2, Math.round((currentT / duration) * 100)));
+        setProgress(pct);
+
+        if (pct < 15) {
+          setProgressText('⚡ Squeezing video frames with hardware acceleration...');
+        } else if (pct < 85) {
+          setProgressText(`✨ Optimizing ${targetW}x${targetH} (${pct}% complete)...`);
+        } else {
+          setProgressText('📦 Finalizing MP4 container & audio sync...');
+        }
+
+        // Android stall recovery: if currentTime stops advancing, force manual frame stepping
+        if (hiddenVideo.paused || currentT === lastTime) {
+          stallCount++;
+          if (stallCount >= 3) {
+            hiddenVideo.play().catch(() => {});
+            hiddenVideo.currentTime = Math.min(duration, hiddenVideo.currentTime + (1 / targetFps));
+          }
+        } else {
+          stallCount = 0;
+          lastTime = currentT;
+        }
+
+        if (hiddenVideo.currentTime >= duration - 0.08) {
+          finishEncoding();
         }
       };
 
@@ -1531,22 +1594,32 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         finishEncoding();
       };
 
-      // Watchdog: ensures video does not stall on mobile or stop prematurely
+      // Watchdog: ensures video does not stall on Android or stop prematurely
       watchdogTimer = window.setInterval(() => {
         if (abortRef.current) {
           finishEncoding();
           return;
         }
-        if (hiddenVideo.paused && !hiddenVideo.ended) {
+        if (hiddenVideo.paused && !hiddenVideo.ended && !hasEnded) {
           hiddenVideo.play().catch(() => {});
+          renderFrame();
         }
         if (hiddenVideo.currentTime >= duration - 0.08) {
           finishEncoding();
         }
-      }, 200);
+      }, 150);
 
       recorder.start(100);
-      await hiddenVideo.play();
+      if (audioSourceNode) {
+        try {
+          audioSourceNode.start(0);
+        } catch {}
+      }
+      try {
+        await hiddenVideo.play();
+      } catch (playErr) {
+        console.warn('Direct play error, falling back to seek stepping:', playErr);
+      }
 
       const rawBlob = await encodedBlobPromise;
       finishEncoding();
@@ -1632,6 +1705,76 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
   return (
     <div className="w-full max-w-5xl mx-auto mt-6 relative z-20">
       {showCelebration && <CelebrationConfetti />}
+
+      {/* Full-Screen Centered Compressing Modal for Android & Desktop */}
+      {isProcessing && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 sm:p-6 bg-slate-950/80 backdrop-blur-lg animate-in fade-in duration-200">
+          <div className="w-full max-w-md bg-white/95 dark:bg-slate-900/95 border-2 border-sky-400/50 dark:border-sky-500/40 rounded-3xl p-6 sm:p-8 shadow-2xl text-center space-y-6 relative overflow-hidden">
+            {/* Top ambient highlight */}
+            <div className="absolute top-0 left-0 right-0 h-1.5 bg-gradient-to-r from-sky-400 via-blue-500 to-indigo-600"></div>
+
+            {/* Status Header Badge */}
+            <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-black bg-sky-100 dark:bg-sky-950/80 text-sky-700 dark:text-sky-300 border border-sky-300 dark:border-sky-800">
+              <Zap size={14} className="text-amber-500 animate-bounce" />
+              <span>Hardware Acceleration Active</span>
+            </div>
+
+            {/* Glowing Percentage Display */}
+            <div className="relative w-32 h-32 mx-auto flex items-center justify-center">
+              <div className="absolute inset-0 rounded-full border-4 border-slate-200 dark:border-slate-800"></div>
+              <div 
+                className="absolute inset-0 rounded-full border-4 border-sky-500 border-t-transparent animate-spin"
+                style={{ animationDuration: '0.9s' }}
+              ></div>
+              <div className="flex flex-col items-center justify-center">
+                <span className="text-4xl font-black text-slate-900 dark:text-white tracking-tight">{progress}%</span>
+                <span className="text-[10px] font-bold text-sky-600 dark:text-sky-400 uppercase tracking-wider">Compressed</span>
+              </div>
+            </div>
+
+            {/* Dynamic Status Text */}
+            <div className="space-y-1">
+              <p className="text-sm font-bold text-slate-800 dark:text-slate-100 leading-snug">{progressText}</p>
+              <p className="text-xs text-slate-500 dark:text-slate-400 font-medium">
+                {settings.mode === 'audio' 
+                  ? 'Extracting studio audio stream...' 
+                  : settings.targetSize 
+                  ? `Targeting exact ${settings.targetSize} MB output` 
+                  : `Encoding at ${settings.qualityPreset} quality preset`}
+              </p>
+            </div>
+
+            {/* Sky Progress Bar with Shimmer */}
+            <div className="space-y-2">
+              <div className="w-full h-3.5 bg-slate-200 dark:bg-slate-800 rounded-full overflow-hidden relative shadow-inner">
+                <div 
+                  className="h-full bg-gradient-to-r from-sky-400 via-blue-500 to-indigo-600 rounded-full relative transition-all duration-200"
+                  style={{ width: `${Math.max(4, progress)}%` }}
+                >
+                  <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/40 to-transparent animate-shimmer"></div>
+                </div>
+              </div>
+              <div className="flex justify-between items-center text-[11px] font-bold text-slate-500 dark:text-slate-400 px-1">
+                <span>0% Start</span>
+                <span>50%</span>
+                <span>100% Done</span>
+              </div>
+            </div>
+
+            {/* Cancel Button */}
+            <div className="pt-2">
+              <button
+                type="button"
+                onClick={cancelProcessing}
+                className="w-full py-3 px-4 rounded-xl font-bold text-xs sm:text-sm text-rose-600 dark:text-rose-400 bg-rose-50 dark:bg-rose-950/40 hover:bg-rose-100 dark:hover:bg-rose-900/40 border border-rose-200 dark:border-rose-800 transition-colors flex items-center justify-center gap-2 kickable"
+              >
+                <X size={15} />
+                <span>Cancel Encoding</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Main Studio Glass Card */}
       <div className="glass-sky-strong rounded-3xl shadow-2xl overflow-hidden transition-all duration-300">
@@ -1741,10 +1884,13 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
                       className="w-full h-full object-contain" 
                       controls={!isProcessing}
                       onLoadedMetadata={(e) => {
+                        const d = e.currentTarget.duration;
+                        const w = e.currentTarget.videoWidth;
+                        const h = e.currentTarget.videoHeight;
                         setMetadata({
-                          duration: e.currentTarget.duration || 0,
-                          width: e.currentTarget.videoWidth || 0,
-                          height: e.currentTarget.videoHeight || 0
+                          duration: Number.isFinite(d) && d > 0 ? d : 10,
+                          width: w > 0 ? w : 1280,
+                          height: h > 0 ? h : 720
                         });
                       }}
                     />
@@ -1753,26 +1899,9 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
                   )}
 
                   {isProcessing && (
-                    <div className="absolute inset-0 bg-slate-900/85 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center text-white">
-                      {/* Smooth circular progress indicator */}
-                      <div className="relative w-20 h-20 mb-4 flex items-center justify-center">
-                        <div className="absolute inset-0 rounded-full border-4 border-white/20"></div>
-                        <div 
-                          className="absolute inset-0 rounded-full border-4 border-sky-400 border-t-transparent animate-spin"
-                          style={{ animationDuration: '0.8s' }}
-                        ></div>
-                        <span className="font-black text-2xl tracking-tight text-white">{progress}%</span>
-                      </div>
-                      
-                      <p className="text-sm font-semibold text-sky-300 mb-5 max-w-xs">{progressText}</p>
-                      
-                      <button 
-                        onClick={cancelProcessing}
-                        className="px-4 py-2 bg-rose-500/20 text-rose-300 hover:bg-rose-500/30 rounded-xl text-xs font-bold border border-rose-400/40 transition-colors flex items-center space-x-1.5 kickable"
-                      >
-                        <X className="w-4 h-4" />
-                        <span>Cancel Encoding</span>
-                      </button>
+                    <div className="absolute inset-0 bg-slate-950/75 backdrop-blur-sm flex flex-col items-center justify-center p-4 text-center text-white">
+                      <div className="w-12 h-12 rounded-full border-3 border-sky-400 border-t-transparent animate-spin mb-3"></div>
+                      <span className="text-xs font-bold text-sky-300 uppercase tracking-wider">Encoding in progress</span>
                     </div>
                   )}
                 </div>

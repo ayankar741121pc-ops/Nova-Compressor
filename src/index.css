@@ -566,7 +566,31 @@ select option {
    MOBILE 60 FPS PERFORMANCE & LAYOUT OPTIMIZATIONS
    ========================================= */
 
+@keyframes shimmer-sweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+.animate-shimmer {
+  animation: shimmer-sweep 2s infinite linear;
+}
+
 @media (max-width: 768px) {
+  /* Mobile-first touch improvements for Android */
+  button, select, input[type="file"] {
+    touch-action: manipulation;
+  }
+  
+  input[type="number"],
+  input[type="text"],
+  select {
+    font-size: 16px !important; /* Prevents auto-zoom on Android Chrome */
+  }
+
   /* Eliminate heavy blur shader passes that drag mobile chips down to 20 FPS */
   .glass-sky,
   .glass-sky-strong,
