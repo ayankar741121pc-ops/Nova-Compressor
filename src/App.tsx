@@ -1483,6 +1483,21 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
     return options;
   }, [metadata.fps]);
 
+  const [settings, setSettings] = useState({
+    mode: defaultMode,
+    outputFormat: 'mp4',
+    resolution: 'keep',
+    frameRate: 'keep',
+    encodingSpeed: 'balanced',
+    qualityPreset: 'medium',
+    bitrateMode: 'auto',
+    customBitrate: 2500,
+    targetSize: '',
+    audioAction: 'keep',
+    audioFormat: 'mp3',
+    audioBitrate: '128k'
+  });
+
   const dynamicPresets = useMemo(() => {
     return getPresetsForFile(file ? file.size : null);
   }, [file]);
@@ -1515,21 +1530,6 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [showCelebration, setShowCelebration] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
-  
-  const [settings, setSettings] = useState({
-    mode: defaultMode,
-    outputFormat: 'mp4',
-    resolution: 'keep',
-    frameRate: 'keep',
-    encodingSpeed: 'balanced',
-    qualityPreset: 'medium',
-    bitrateMode: 'auto',
-    customBitrate: 2500,
-    targetSize: '',
-    audioAction: 'keep',
-    audioFormat: 'mp3',
-    audioBitrate: '128k'
-  });
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const abortRef = useRef(false);
