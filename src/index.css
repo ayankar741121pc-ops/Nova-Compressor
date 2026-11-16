@@ -185,13 +185,11 @@ html.dark body {
 @keyframes sun-glow-pulse {
   0%, 100% {
     transform: scale(1);
-    opacity: 0.88;
-    filter: drop-shadow(0 0 45px rgba(254, 240, 138, 0.7));
+    opacity: 0.92;
   }
   50% {
-    transform: scale(1.08);
+    transform: scale(1.05);
     opacity: 1;
-    filter: drop-shadow(0 0 75px rgba(253, 224, 71, 0.95));
   }
 }
 
@@ -217,76 +215,64 @@ html.dark body {
 }
 
 .animate-cloud-slow {
-  animation: cloud-drift-left 32s ease-in-out infinite;
-  will-change: transform;
+  animation: cloud-drift-left 36s ease-in-out infinite;
   transform: translate3d(0, 0, 0);
-  backface-visibility: hidden;
+  contain: paint;
 }
 
 .animate-cloud-medium {
-  animation: cloud-drift-right 24s ease-in-out infinite;
-  will-change: transform;
+  animation: cloud-drift-right 28s ease-in-out infinite;
   transform: translate3d(0, 0, 0);
-  backface-visibility: hidden;
+  contain: paint;
 }
 
 .animate-cloud-fast {
-  animation: cloud-drift-left 18s ease-in-out infinite;
-  will-change: transform;
+  animation: cloud-drift-left 20s ease-in-out infinite;
   transform: translate3d(0, 0, 0);
-  backface-visibility: hidden;
+  contain: paint;
 }
 
 .animate-balloon {
-  animation: float-balloon 12s cubic-bezier(0.45, 0.05, 0.55, 0.95) infinite;
-  will-change: transform;
+  animation: float-balloon 14s cubic-bezier(0.45, 0.05, 0.55, 0.95) infinite;
   transform: translate3d(0, 0, 0);
 }
 
 .animate-sun {
   animation: sun-glow-pulse 6s ease-in-out infinite;
-  will-change: transform, filter;
-  transform: translate3d(0, 0, 0);
+  box-shadow: 0 0 60px rgba(251, 191, 36, 0.65);
 }
 
 .animate-sun-rays {
-  animation: sun-ray-rotate 40s linear infinite;
-  will-change: transform;
-  transform: translate3d(0, 0, 0);
+  animation: sun-ray-rotate 48s linear infinite;
 }
 
 @keyframes moon-glow-pulse {
   0%, 100% {
     transform: scale(1);
     opacity: 0.92;
-    filter: drop-shadow(0 0 35px rgba(199, 210, 254, 0.75)) drop-shadow(0 0 70px rgba(129, 140, 248, 0.45));
   }
   50% {
-    transform: scale(1.06);
+    transform: scale(1.05);
     opacity: 1;
-    filter: drop-shadow(0 0 55px rgba(224, 231, 255, 0.95)) drop-shadow(0 0 95px rgba(165, 180, 252, 0.65));
   }
 }
 
 .animate-moon {
-  animation: moon-glow-pulse 5s ease-in-out infinite;
-  will-change: transform, filter;
+  animation: moon-glow-pulse 6s ease-in-out infinite;
+  box-shadow: 0 0 60px rgba(165, 180, 252, 0.75);
 }
 
 @keyframes star-twinkle {
   0%, 100% {
     opacity: 0.25;
-    transform: scale(0.85);
   }
   50% {
-    opacity: 1;
-    transform: scale(1.25);
-    filter: drop-shadow(0 0 8px rgba(255, 255, 255, 0.95));
+    opacity: 0.95;
   }
 }
 
 .animate-twinkle {
-  animation: star-twinkle 3s ease-in-out infinite;
+  animation: star-twinkle 3.5s ease-in-out infinite;
 }
 
 @keyframes shooting-star {
@@ -295,19 +281,19 @@ html.dark body {
     opacity: 0;
   }
   15% {
-    opacity: 1;
+    opacity: 0.8;
   }
-  70% {
-    opacity: 0.9;
+  60% {
+    opacity: 0.7;
   }
   100% {
-    transform: translate3d(-460px, 380px, 0) rotate(-38deg);
+    transform: translate3d(-380px, 320px, 0) rotate(-38deg);
     opacity: 0;
   }
 }
 
 .animate-shooting-star {
-  animation: shooting-star 9s cubic-bezier(0.25, 0.1, 0.25, 1) infinite;
+  animation: shooting-star 12s cubic-bezier(0.25, 0.1, 0.25, 1) infinite;
 }
 
 .animate-plane {

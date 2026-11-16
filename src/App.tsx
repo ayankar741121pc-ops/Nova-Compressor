@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { BrowserRouter as Router, Routes, Route, Link, useLocation } from 'react-router-dom';
 import { 
   UploadCloud, FileVideo, Download, Play, 
@@ -395,9 +395,9 @@ const patchMp4Duration = (buffer: ArrayBuffer, durationSec: number): ArrayBuffer
     if (mehdPos !== -1) {
       const version = u8[mehdPos + 4];
       if (version === 0) {
-        view.setUint32(mehdPos + 8, Math.round(durationSec * 1000));
+        view.setUint32(mehdPos + 8, Math.round(durationSec * mvhdTimescale));
       } else if (version === 1) {
-        view.setBigUint64(mehdPos + 8, BigInt(Math.round(durationSec * 1000)));
+        view.setBigUint64(mehdPos + 8, BigInt(Math.round(durationSec * mvhdTimescale)));
       }
     }
 
@@ -426,6 +426,105 @@ const fixMediaDuration = async (blob: Blob, durationSec: number): Promise<Blob> 
   } catch (err) {
     console.warn('Error in fixMediaDuration:', err);
     return blob;
+  }
+};
+
+interface VideoFileInfo {
+  fps: number;
+  hasAudio: boolean;
+  timescale?: number;
+}
+
+const parseVideoFileHeader = async (file: File): Promise<VideoFileInfo> => {
+  try {
+    const slice = await file.slice(0, Math.min(file.size, 512 * 1024)).arrayBuffer();
+    const u8 = new Uint8Array(slice);
+    const view = new DataView(slice);
+
+    let fps = 30;
+    let hasAudio = false;
+
+    // Check if MP4 / QuickTime (has 'ftyp' or 'moov')
+    const hasMoov = findSequence(u8, [0x6d, 0x6f, 0x6f, 0x76]) !== -1;
+    const hasFtyp = findSequence(u8, [0x66, 0x74, 0x79, 0x70]) !== -1;
+
+    if (hasMoov || hasFtyp) {
+      // Check for audio handler 'soun'
+      if (findSequence(u8, [0x73, 0x6f, 0x75, 0x6e]) !== -1) {
+        hasAudio = true;
+      }
+
+      // Check timescale from mdhd
+      let timescale = 0;
+      const mdhdPos = findSequence(u8, [0x6d, 0x64, 0x68, 0x64]);
+      if (mdhdPos !== -1) {
+        const version = u8[mdhdPos + 4];
+        timescale = view.getUint32(mdhdPos + (version === 0 ? 16 : 24));
+      }
+
+      // Check stts (time-to-sample)
+      const sttsPos = findSequence(u8, [0x73, 0x74, 0x74, 0x73]);
+      if (sttsPos !== -1 && timescale > 0) {
+        const entryCount = view.getUint32(sttsPos + 8);
+        if (entryCount > 0) {
+          const sampleDelta = view.getUint32(sttsPos + 16);
+          if (sampleDelta > 0) {
+            const calcFps = timescale / sampleDelta;
+            if (calcFps >= 10 && calcFps <= 120) {
+              fps = Math.round(calcFps);
+            }
+          }
+        }
+      }
+
+      // Check trun (fragmented track run) if stts was empty
+      if (fps === 30 && timescale > 0) {
+        const trunPos = findSequence(u8, [0x74, 0x72, 0x75, 0x6e]);
+        if (trunPos !== -1) {
+          const flags = (u8[trunPos + 5] << 16) | (u8[trunPos + 6] << 8) | u8[trunPos + 7];
+          const hasDur = (flags & 0x000100) !== 0;
+          if (hasDur) {
+            let offset = trunPos + 12;
+            if ((flags & 0x000001) !== 0) offset += 4; // data-offset
+            if ((flags & 0x000004) !== 0) offset += 4; // first-sample-flags
+            if (offset + 4 <= u8.length) {
+              const sampleDur = view.getUint32(offset);
+              if (sampleDur > 0) {
+                const calcFps = timescale / sampleDur;
+                if (calcFps >= 10 && calcFps <= 120) {
+                  fps = Math.round(calcFps);
+                }
+              }
+            }
+          }
+        }
+      }
+
+      return { fps, hasAudio, timescale };
+    }
+
+    // Check WebM
+    if (u8.length >= 4 && u8[0] === 0x1a && u8[1] === 0x45 && u8[2] === 0xdf && u8[3] === 0xa3) {
+      if (findSequence(u8, [0x83, 0x02]) !== -1) {
+        hasAudio = true;
+      }
+      const durPos = findSequence(u8, [0x23, 0xe3, 0x83]);
+      if (durPos !== -1 && durPos + 7 <= u8.length) {
+        const sizeByte = u8[durPos + 3] & 0x0f;
+        if (sizeByte === 4) {
+          const ns = view.getUint32(durPos + 4);
+          if (ns > 0) {
+            const calcFps = 1e9 / ns;
+            if (calcFps >= 10 && calcFps <= 120) fps = Math.round(calcFps);
+          }
+        }
+      }
+      return { fps, hasAudio };
+    }
+
+    return { fps: 30, hasAudio: true };
+  } catch (err) {
+    return { fps: 30, hasAudio: true };
   }
 };
 
@@ -1181,7 +1280,78 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
   const { play } = useSound();
   const [file, setFile] = useState<File | null>(null);
   const [videoPreview, setVideoPreview] = useState<string | null>(null);
-  const [metadata, setMetadata] = useState<{ duration: number; width: number; height: number }>({ duration: 0, width: 0, height: 0 });
+  const [metadata, setMetadata] = useState<{
+    duration: number;
+    width: number;
+    height: number;
+    fps?: number;
+    hasAudio?: boolean;
+  }>({ duration: 0, width: 0, height: 0, fps: 30, hasAudio: true });
+
+  const resolutionOptions = useMemo(() => {
+    const options = [
+      { value: 'keep', label: `Keep Original Dimensions (${metadata.width > 0 ? `${metadata.width}×${metadata.height}` : 'Auto'})` }
+    ];
+    const h = metadata.height || 0;
+    const w = metadata.width || 0;
+    const maxDim = Math.max(h, w);
+    const minDim = Math.min(h, w);
+
+    if (h === 0 && w === 0) {
+      return [
+        { value: 'keep', label: 'Keep Original Dimensions' },
+        { value: '1080p', label: '1080p (Full HD)' },
+        { value: '720p', label: '720p (HD - Best for chats)' },
+        { value: '480p', label: '480p (SD - Tiny size)' },
+        { value: '360p', label: '360p (Ultra-Light - Max saving)' }
+      ];
+    }
+
+    if (minDim >= 900 || maxDim >= 1800) {
+      options.push({ value: '1080p', label: '1080p (Full HD)' });
+    }
+    if (minDim >= 600 || maxDim >= 1100) {
+      options.push({ value: '720p', label: '720p (HD - Best for chats)' });
+    }
+    if (minDim >= 400 || maxDim >= 700) {
+      options.push({ value: '480p', label: '480p (SD - Tiny size)' });
+    }
+    if (minDim >= 300 || maxDim >= 450) {
+      options.push({ value: '360p', label: '360p (Ultra-Light - Max saving)' });
+    }
+    return options;
+  }, [metadata.width, metadata.height]);
+
+  const frameRateOptions = useMemo(() => {
+    const detectedFps = metadata.fps ? Math.round(metadata.fps) : 30;
+    const options = [
+      { value: 'keep', label: `Original Frame Rate (${detectedFps} FPS)` }
+    ];
+    if (detectedFps >= 50) {
+      options.push({ value: '60', label: '60 FPS (Ultra Smooth)' });
+    }
+    if (detectedFps >= 28) {
+      options.push({ value: '30', label: '30 FPS (Standard Web & Mobile)' });
+    }
+    options.push({ value: '24', label: '24 FPS (Fast Chat / WhatsApp)' });
+    return options;
+  }, [metadata.fps]);
+
+  useEffect(() => {
+    if (!metadata.width) return;
+    if (settings.resolution !== 'keep') {
+      const exists = resolutionOptions.some(opt => opt.value === settings.resolution);
+      if (!exists) {
+        setSettings(prev => ({ ...prev, resolution: 'keep' }));
+      }
+    }
+    if (settings.frameRate !== 'keep') {
+      const exists = frameRateOptions.some(opt => opt.value === settings.frameRate);
+      if (!exists) {
+        setSettings(prev => ({ ...prev, frameRate: 'keep' }));
+      }
+    }
+  }, [resolutionOptions, frameRateOptions]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [progressText, setProgressText] = useState('');
@@ -1248,6 +1418,14 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
     setProgress(0);
     setTargetMessage(null);
     setErrorMessage(null);
+
+    parseVideoFileHeader(selected).then((info) => {
+      setMetadata((prev) => ({
+        ...prev,
+        fps: info.fps,
+        hasAudio: info.hasAudio
+      }));
+    });
   };
 
   const handleDrop = (e: React.DragEvent) => {
@@ -1263,6 +1441,14 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       setProgress(0);
       setTargetMessage(null);
       setErrorMessage(null);
+
+      parseVideoFileHeader(dropped).then((info) => {
+        setMetadata((prev) => ({
+          ...prev,
+          fps: info.fps,
+          hasAudio: info.hasAudio
+        }));
+      });
     }
   };
 
@@ -1360,7 +1546,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       targetW = Math.max(2, targetW % 2 === 0 ? targetW : targetW + 1);
       targetH = Math.max(2, targetH % 2 === 0 ? targetH : targetH + 1);
 
-      const includeAudio = settings.audioAction !== 'remove';
+      const includeAudio = settings.audioAction !== 'remove' && metadata.hasAudio !== false;
       const audioBps = !includeAudio 
         ? 0 
         : settings.audioAction === 'voice' 
@@ -1369,29 +1555,44 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       const targetMb = settings.targetSize ? parseFloat(settings.targetSize) : null;
       let videoBps = 2500000;
 
+      // Quality & Speed headroom (Studio mode uses 0.96 for maximum quality fidelity)
+      const headroom = settings.encodingSpeed === 'studio' 
+        ? 0.96 
+        : settings.encodingSpeed === 'balanced' 
+        ? 0.93 
+        : 0.88;
+
       if (targetMb && targetMb > 0) {
-        const totalBits = targetMb * 8 * 1024 * 1024;
+        const targetBytes = targetMb * 1024 * 1024;
+        const totalBits = targetBytes * 8;
         const totalBps = totalBits / duration;
-        videoBps = Math.max(60000, Math.floor((totalBps - audioBps) * 0.92));
+        
+        if (file.size <= targetBytes) {
+          // File is already under target MB! Do not overcompress or crush quality!
+          const originalBps = (file.size * 8) / duration;
+          const preserveRatio = settings.encodingSpeed === 'studio' ? 0.98 : settings.encodingSpeed === 'balanced' ? 0.92 : 0.85;
+          videoBps = Math.max(120000, Math.floor((originalBps - audioBps) * preserveRatio));
+        } else {
+          // File is larger than target: target exact MB with speed-appropriate headroom
+          videoBps = Math.max(80000, Math.floor((totalBps - audioBps) * headroom));
+        }
       } else if (settings.bitrateMode === 'custom') {
         videoBps = Math.max(60000, settings.customBitrate * 1000);
       } else {
         const originalBps = (file.size * 8) / duration;
         const presetFactor =
           settings.qualityPreset === 'fast'
-            ? 0.32
+            ? 0.35
             : settings.qualityPreset === 'medium'
-            ? 0.48
-            : 0.68;
-        videoBps = Math.max(120000, Math.floor(originalBps * presetFactor - audioBps));
+            ? 0.55
+            : 0.78;
+        videoBps = Math.max(150000, Math.floor(originalBps * presetFactor - audioBps));
       }
 
       const { mimeType, baseMime, ext } = getSupportedVideoConfig(settings.outputFormat, includeAudio);
       const targetFps = settings.frameRate !== 'keep' 
         ? parseInt(settings.frameRate, 10) || 30 
-        : settings.encodingSpeed === 'turbo' 
-        ? 24 
-        : 30;
+        : Math.min(60, Math.max(24, Math.round(metadata.fps || 30)));
 
       setProgress(2);
       setProgressText(`Warming up ${targetW}x${targetH} @ ${targetFps} FPS engine...`);
@@ -1409,14 +1610,15 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       hiddenVideo.crossOrigin = 'anonymous';
       hiddenVideo.preload = 'auto';
 
-      // Attach offscreen in DOM so mobile browsers won't pause playback
+      // Keep within visible viewport at 2x2px opacity 0.01 to prevent Android background throttling
       hiddenVideo.style.position = 'fixed';
-      hiddenVideo.style.top = '-9999px';
-      hiddenVideo.style.left = '-9999px';
-      hiddenVideo.style.width = '4px';
-      hiddenVideo.style.height = '4px';
+      hiddenVideo.style.bottom = '0px';
+      hiddenVideo.style.right = '0px';
+      hiddenVideo.style.width = '2px';
+      hiddenVideo.style.height = '2px';
       hiddenVideo.style.opacity = '0.01';
       hiddenVideo.style.pointerEvents = 'none';
+      hiddenVideo.style.zIndex = '-999';
       document.body.appendChild(hiddenVideo);
 
       await new Promise<void>((resolve, reject) => {
@@ -1457,7 +1659,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       const combinedTracks: MediaStreamTrack[] = [...canvasStream.getVideoTracks()];
 
       let audioCtx: AudioContext | null = null;
-      let audioSourceNode: AudioBufferSourceNode | null = null;
+      let audioEl: HTMLAudioElement | null = null;
       if (includeAudio) {
         try {
           const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
@@ -1466,23 +1668,38 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
             if (audioCtx.state === 'suspended') {
               await audioCtx.resume().catch(() => {});
             }
-            // Decode audio directly from file bytes in hardware
-            const fileSlice = await file.slice(0, Math.min(file.size, 100 * 1024 * 1024)).arrayBuffer();
-            const decodedAudio = await audioCtx.decodeAudioData(fileSlice).catch(() => null);
-            if (decodedAudio) {
-              audioSourceNode = audioCtx.createBufferSource();
-              audioSourceNode.buffer = decodedAudio;
-              const destNode = audioCtx.createMediaStreamDestination();
-              audioSourceNode.connect(destNode);
-              const audioTrack = destNode.stream.getAudioTracks()[0];
-              if (audioTrack) {
-                combinedTracks.push(audioTrack);
-              }
+
+            audioEl = document.createElement('audio');
+            audioEl.src = URL.createObjectURL(file);
+            audioEl.preload = 'auto';
+            audioEl.volume = 1;
+            audioEl.muted = false; // Web Audio requires muted=false so sound passes to destNode
+
+            const audioSourceNode = audioCtx.createMediaElementSource(audioEl);
+            const destNode = audioCtx.createMediaStreamDestination();
+            audioSourceNode.connect(destNode);
+
+            const capturedAudioTracks = destNode.stream.getAudioTracks();
+            if (capturedAudioTracks.length > 0) {
+              combinedTracks.push(capturedAudioTracks[0]);
             }
           }
         } catch (err) {
-          console.warn('Audio decoding fallback:', err);
+          console.warn('Web Audio capture initialization error:', err);
         }
+      }
+
+      // Fallback audio track capture via HTMLMediaElement captureStream if Web Audio was empty
+      if (includeAudio && combinedTracks.length === 1) {
+        try {
+          const directStream = (hiddenVideo as any).captureStream ? (hiddenVideo as any).captureStream() : (hiddenVideo as any).mozCaptureStream ? (hiddenVideo as any).mozCaptureStream() : null;
+          if (directStream) {
+            const directTracks = directStream.getAudioTracks();
+            if (directTracks.length > 0) {
+              combinedTracks.push(directTracks[0]);
+            }
+          }
+        } catch {}
       }
 
       const outputStream = new MediaStream(combinedTracks);
@@ -1531,6 +1748,15 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         if (animationFrameId !== null) {
           cancelAnimationFrame(animationFrameId);
         }
+        if (audioEl) {
+          audioEl.pause();
+          URL.revokeObjectURL(audioEl.src);
+          audioEl = null;
+        }
+        if (audioCtx) {
+          audioCtx.close().catch(() => {});
+          audioCtx = null;
+        }
         if (recorder.state !== 'inactive') {
           try {
             recorder.stop();
@@ -1552,6 +1778,11 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
           setProgressText(`✨ Optimizing ${targetW}x${targetH} (${pct}% complete)...`);
         } else {
           setProgressText('📦 Finalizing MP4 container & audio sync...');
+        }
+
+        // Sync audio position with video position
+        if (audioEl && Math.abs(audioEl.currentTime - currentT) > 0.15) {
+          audioEl.currentTime = currentT;
         }
 
         // Android stall recovery: if currentTime stops advancing, force manual frame stepping
@@ -1610,10 +1841,9 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       }, 150);
 
       recorder.start(100);
-      if (audioSourceNode) {
-        try {
-          audioSourceNode.start(0);
-        } catch {}
+      if (audioEl) {
+        audioEl.currentTime = 0;
+        audioEl.play().catch(() => {});
       }
       try {
         await hiddenVideo.play();
@@ -1629,9 +1859,6 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       }
 
       outputStream.getTracks().forEach((t) => t.stop());
-      if (audioCtx) {
-        await audioCtx.close();
-      }
       URL.revokeObjectURL(hiddenVideo.src);
 
       if (abortRef.current) return;
@@ -1640,13 +1867,15 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         throw new Error('Encoded output was 0 bytes. Please try another format or resolution.');
       }
 
-      // Fix container duration metadata (resolves WhatsApp & Android 3-second playback issue)
+      // Fix container duration metadata (resolves WhatsApp & Android 4-second playback issue)
       setProgressText('Fixing container duration for WhatsApp & Gallery compatibility...');
-      const finalBlob = await fixMediaDuration(rawBlob, duration);
+      const actualDuration = Math.max(0.5, hiddenVideo.currentTime || duration);
+      const finalBlob = await fixMediaDuration(rawBlob, actualDuration);
 
       setProgress(100);
       const finalUrl = URL.createObjectURL(finalBlob);
-      const finalFileName = `novacompress_${baseName}.${ext}`;
+      const finalExt = rawBlob.type.includes('mp4') ? 'mp4' : rawBlob.type.includes('webm') ? 'webm' : ext;
+      const finalFileName = `novacompress_${baseName}.${finalExt}`;
 
       if (targetMb) {
         const actualMb = finalBlob.size / (1024 * 1024);
@@ -1887,11 +2116,12 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
                         const d = e.currentTarget.duration;
                         const w = e.currentTarget.videoWidth;
                         const h = e.currentTarget.videoHeight;
-                        setMetadata({
+                        setMetadata((prev) => ({
+                          ...prev,
                           duration: Number.isFinite(d) && d > 0 ? d : 10,
                           width: w > 0 ? w : 1280,
                           height: h > 0 ? h : 720
-                        });
+                        }));
                       }}
                     />
                   ) : (
@@ -1917,7 +2147,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
                     <span className="font-extrabold text-sky-700 dark:text-sky-400">{formatSize(file.size)}</span>
                     {metadata.duration > 0 && (
                       <span className="text-slate-500 dark:text-slate-400 font-medium">
-                        {Math.round(metadata.duration)}s • {metadata.width}×{metadata.height}
+                        {Math.round(metadata.duration)}s • {metadata.width}×{metadata.height} • {Math.round(metadata.fps || 30)} FPS
                       </span>
                     )}
                   </div>
@@ -2001,13 +2231,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
                           value={settings.resolution}
                           onChange={(val) => setSettings({...settings, resolution: val})}
                           disabled={isProcessing}
-                          options={[
-                            { value: 'keep', label: 'Keep Original Dimensions' },
-                            { value: '1080p', label: '1080p (Full HD)' },
-                            { value: '720p', label: '720p (HD - Best for chats)' },
-                            { value: '480p', label: '480p (SD - Tiny size)' },
-                            { value: '360p', label: '360p (Ultra-Light - Max saving)' }
-                          ]}
+                          options={resolutionOptions}
                         />
                       </div>
                     </div>
@@ -2020,12 +2244,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
                           value={settings.frameRate}
                           onChange={(val) => setSettings({...settings, frameRate: val})}
                           disabled={isProcessing}
-                          options={[
-                            { value: 'keep', label: 'Original Frame Rate' },
-                            { value: '60', label: '60 FPS (Ultra Smooth)' },
-                            { value: '30', label: '30 FPS (Standard Web & Mobile)' },
-                            { value: '24', label: '24 FPS (Fast Chat / WhatsApp)' }
-                          ]}
+                          options={frameRateOptions}
                         />
                       </div>
 
