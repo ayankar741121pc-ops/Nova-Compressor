@@ -1907,13 +1907,6 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
             hiddenVideo.volume = 1;
             hiddenVideo.removeAttribute('muted');
 
-            // Attach dummy silent audio sink to keep mobile audio rendering pipeline active
-            const dummyAudio = document.createElement('audio');
-            dummyAudio.srcObject = destNode.stream;
-            dummyAudio.muted = true;
-            dummyAudio.volume = 0;
-            dummyAudio.play().catch(() => {});
-
             const capturedAudioTracks = destNode.stream.getAudioTracks();
             if (capturedAudioTracks.length > 0) {
               capturedAudioTracks[0].enabled = true;
@@ -2005,9 +1998,22 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         }
       };
 
-      const renderCurrentFrame = () => {
+      let lastRenderMediaTime = -1;
+
+      const renderCurrentFrame = (mediaTime?: number) => {
         if (hasEnded || abortRef.current) return;
         
+        const currentT = hiddenVideo.currentTime;
+        // Avoid duplicate drawing if video hasn't progressed:
+        if (typeof mediaTime === 'number') {
+          if (mediaTime === lastRenderMediaTime) return;
+          lastRenderMediaTime = mediaTime;
+        } else if (currentT === lastRenderMediaTime) {
+          return;
+        } else {
+          lastRenderMediaTime = currentT;
+        }
+
         ctx.drawImage(hiddenVideo, 0, 0, targetW, targetH);
         frameCount++;
 
@@ -2015,7 +2021,6 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
           duration = hiddenVideo.duration;
         }
         const effectiveDuration = Number.isFinite(duration) && duration > 0.5 ? duration : 10;
-        const currentT = hiddenVideo.currentTime;
         const pct = Math.min(99, Math.max(8, Math.round((currentT / effectiveDuration) * 100)));
         setProgress(pct);
 
@@ -2027,39 +2032,16 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
           setProgressText('📦 Finalizing MP4 container & audio sync...');
         }
 
-        // Android stall recovery: only kick if genuinely stalled for > 1.2s (40 frames)
-        if (hiddenVideo.paused || currentT === lastTime) {
-          stallCount++;
-          if (stallCount >= 40) {
-            stallCount = 0;
-            hiddenVideo.play().catch(() => {});
-          }
-        } else {
-          stallCount = 0;
-          lastTime = currentT;
-        }
-
         if (hiddenVideo.currentTime >= effectiveDuration - 0.08 || hiddenVideo.ended) {
           finishEncoding();
         }
       };
 
-      // Dual-drive compositor engine:
-      // 1. Decoder pump (requestVideoFrameCallback) draws as soon as video hardware decodes a new frame
-      // 2. Refresh pump (requestAnimationFrame) draws in sync with display refresh rate (60Hz / 120Hz)
-      const pumpFrame = () => {
+      const pumpFrame = (_now: number, metadata?: any) => {
         if (hasEnded || abortRef.current) return;
-        renderCurrentFrame();
+        renderCurrentFrame(metadata?.mediaTime);
         if ('requestVideoFrameCallback' in hiddenVideo && !hiddenVideo.ended && !hasEnded) {
           frameCallbackId = (hiddenVideo as any).requestVideoFrameCallback(pumpFrame);
-        }
-      };
-
-      const pumpRaf = () => {
-        if (hasEnded || abortRef.current) return;
-        renderCurrentFrame();
-        if (!hiddenVideo.ended && !hasEnded) {
-          animationFrameId = window.requestAnimationFrame(pumpRaf);
         }
       };
 
@@ -2079,7 +2061,7 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         if (hiddenVideo.currentTime >= effectiveDuration - 0.08) {
           finishEncoding();
         }
-      }, 250);
+      }, 300);
 
       // Pause preview player to free up Android hardware decoder session
       if (videoRef.current) {
@@ -2088,29 +2070,26 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         } catch {}
       }
 
-      // Safe playback start: race with 600ms timeout so progress never freezes at 5% on Android
-      const playPromise = hiddenVideo.play().catch(async (playErr) => {
+      // Safe playback start:
+      try {
+        await hiddenVideo.play();
+      } catch (playErr) {
         console.warn('Playback error, retrying muted:', playErr);
         hiddenVideo.muted = true;
         hiddenVideo.volume = 0;
-        return hiddenVideo.play().catch(() => {});
-      });
+        await hiddenVideo.play().catch(() => {});
+      }
 
-      await Promise.race([
-        playPromise,
-        new Promise((r) => setTimeout(r, 600))
-      ]);
-
-      // Start recorder and frame engines:
+      // Start recorder:
       recorder.start(100);
 
+      // Dedicated single-source frame pumper (no busy-loops):
       if ('requestVideoFrameCallback' in hiddenVideo) {
         frameCallbackId = (hiddenVideo as any).requestVideoFrameCallback(pumpFrame);
+      } else {
+        const frameIntervalMs = Math.max(16, Math.floor(1000 / targetFps));
+        renderIntervalId = window.setInterval(() => renderCurrentFrame(), frameIntervalMs);
       }
-      animationFrameId = window.requestAnimationFrame(pumpRaf);
-
-      const frameIntervalMs = Math.max(16, Math.floor(1000 / targetFps));
-      renderIntervalId = window.setInterval(renderCurrentFrame, frameIntervalMs);
 
       const rawBlob = await encodedBlobPromise;
       finishEncoding();
