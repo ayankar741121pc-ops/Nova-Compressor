@@ -570,6 +570,83 @@ const parseVideoFileHeader = async (file: File): Promise<VideoFileInfo> => {
   }
 };
 
+const probeVideoFps = (file: File): Promise<number> => {
+  return new Promise((resolve) => {
+    try {
+      const video = document.createElement('video');
+      video.preload = 'auto';
+      video.muted = true;
+      video.defaultMuted = true;
+      video.volume = 0;
+      video.playsInline = true;
+      (video as any).webkitPlaysInline = true;
+
+      const blobUrl = URL.createObjectURL(file);
+      video.src = blobUrl;
+
+      let resolved = false;
+      const cleanup = (fps: number) => {
+        if (resolved) return;
+        resolved = true;
+        video.pause();
+        video.removeAttribute('src');
+        video.load();
+        URL.revokeObjectURL(blobUrl);
+        resolve(fps);
+      };
+
+      const timer = setTimeout(() => {
+        cleanup(30);
+      }, 1500);
+
+      video.onloadedmetadata = () => {
+        if (!('requestVideoFrameCallback' in video)) {
+          clearTimeout(timer);
+          cleanup(30);
+          return;
+        }
+
+        const frameTimes: number[] = [];
+        const onFrame = (_now: number, metadata: any) => {
+          if (resolved) return;
+          if (metadata && typeof metadata.mediaTime === 'number') {
+            frameTimes.push(metadata.mediaTime);
+            if (frameTimes.length >= 3) {
+              const d1 = Math.abs(frameTimes[1] - frameTimes[0]);
+              const d2 = Math.abs(frameTimes[2] - frameTimes[1]);
+              const avgD = (d1 + d2) / 2;
+              if (avgD > 0.005 && avgD < 0.1) {
+                const calc = Math.round(1 / avgD);
+                if (calc >= 12 && calc <= 144) {
+                  clearTimeout(timer);
+                  cleanup(calc);
+                  return;
+                }
+              }
+            }
+          }
+          if (frameTimes.length < 8 && !video.paused && !resolved) {
+            (video as any).requestVideoFrameCallback(onFrame);
+          }
+        };
+
+        (video as any).requestVideoFrameCallback(onFrame);
+        video.play().catch(() => {
+          clearTimeout(timer);
+          cleanup(30);
+        });
+      };
+
+      video.onerror = () => {
+        clearTimeout(timer);
+        cleanup(30);
+      };
+    } catch {
+      resolve(30);
+    }
+  });
+};
+
 // ==========================================
 // MOCK SEO DATA & CONFIGURATION
 // ==========================================
@@ -1619,6 +1696,15 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         hasAudio: info.hasAudio
       }));
     });
+
+    probeVideoFps(selected).then((realFps) => {
+      if (realFps && realFps >= 12 && realFps <= 144) {
+        setMetadata((prev) => ({
+          ...prev,
+          fps: realFps
+        }));
+      }
+    });
   };
 
   const handleDrop = (e: React.DragEvent) => {
@@ -1641,6 +1727,15 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
           fps: info.fps,
           hasAudio: info.hasAudio
         }));
+      });
+
+      probeVideoFps(dropped).then((realFps) => {
+        if (realFps && realFps >= 12 && realFps <= 144) {
+          setMetadata((prev) => ({
+            ...prev,
+            fps: realFps
+          }));
+        }
       });
     }
   };
@@ -2058,12 +2153,22 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         }
       };
 
-      // Primary frame driver: requestVideoFrameCallback for perfectly synchronized, zero-drop frame capture!
+      // Dual-drive compositor engine:
+      // 1. Decoder pump (requestVideoFrameCallback) draws as soon as video hardware decodes a new frame
+      // 2. Refresh pump (requestAnimationFrame) draws in sync with display refresh rate (60Hz / 120Hz)
       const pumpFrame = () => {
         if (hasEnded || abortRef.current) return;
         renderCurrentFrame();
         if ('requestVideoFrameCallback' in hiddenVideo && !hiddenVideo.ended && !hasEnded) {
           frameCallbackId = (hiddenVideo as any).requestVideoFrameCallback(pumpFrame);
+        }
+      };
+
+      const pumpRaf = () => {
+        if (hasEnded || abortRef.current) return;
+        renderCurrentFrame();
+        if (!hiddenVideo.ended && !hasEnded) {
+          animationFrameId = window.requestAnimationFrame(pumpRaf);
         }
       };
 
@@ -2111,13 +2216,10 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       if ('requestVideoFrameCallback' in hiddenVideo) {
         frameCallbackId = (hiddenVideo as any).requestVideoFrameCallback(pumpFrame);
       }
+      animationFrameId = window.requestAnimationFrame(pumpRaf);
 
       const frameIntervalMs = Math.max(16, Math.floor(1000 / targetFps));
-      renderIntervalId = window.setInterval(() => {
-        if (!('requestVideoFrameCallback' in hiddenVideo)) {
-          renderCurrentFrame();
-        }
-      }, frameIntervalMs);
+      renderIntervalId = window.setInterval(renderCurrentFrame, frameIntervalMs);
 
       const rawBlob = await encodedBlobPromise;
       finishEncoding();
