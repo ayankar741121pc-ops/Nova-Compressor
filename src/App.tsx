@@ -437,104 +437,96 @@ interface VideoFileInfo {
 
 const parseVideoFileHeader = async (file: File): Promise<VideoFileInfo> => {
   try {
-    // 1. Read head slice (first 2MB to catch moov and trak)
-    const headSlice = await file.slice(0, Math.min(file.size, 2 * 1024 * 1024)).arrayBuffer();
-    let u8 = new Uint8Array(headSlice);
-    let view = new DataView(headSlice);
-
     let fps = 30;
-    let hasAudio = true; // Default true so phone recordings preserve audio
+    let hasAudio = true;
     let foundFps = false;
 
-    // Check if moov is present in head
-    let hasMoov = findSequence(u8, [0x6d, 0x6f, 0x6f, 0x76]) !== -1;
-    const hasFtyp = findSequence(u8, [0x66, 0x74, 0x79, 0x70]) !== -1;
+    // Scan head slice (up to 4MB)
+    const headSlice = await file.slice(0, Math.min(file.size, 4 * 1024 * 1024)).arrayBuffer();
+    const buffersToScan: ArrayBuffer[] = [headSlice];
 
-    // If MP4/MOV and moov is NOT in the first 2MB, check the last 4MB (phone recordings put moov at the tail!)
-    if ((hasFtyp || file.name.match(/\.(mp4|mov|m4v)$/i)) && !hasMoov && file.size > 2 * 1024 * 1024) {
+    // If file is > 2MB, also scan tail slice (last 6MB) where phone cameras write moov & stts
+    if (file.size > 2 * 1024 * 1024) {
       try {
-        const tailSlice = await file.slice(Math.max(0, file.size - 4 * 1024 * 1024), file.size).arrayBuffer();
-        const tailU8 = new Uint8Array(tailSlice);
-        if (findSequence(tailU8, [0x6d, 0x6f, 0x6f, 0x76]) !== -1) {
-          u8 = tailU8;
-          view = new DataView(tailSlice);
-          hasMoov = true;
-        }
+        const tailSlice = await file.slice(Math.max(0, file.size - 6 * 1024 * 1024), file.size).arrayBuffer();
+        buffersToScan.push(tailSlice);
       } catch {}
     }
 
-    if (hasMoov || hasFtyp) {
+    for (const buf of buffersToScan) {
+      const u8 = new Uint8Array(buf);
+      const view = new DataView(buf);
+
+      // Audio handler check
       if (findSequence(u8, [0x73, 0x6f, 0x75, 0x6e]) !== -1) {
         hasAudio = true;
       }
 
-      // Parse video trak specifically
-      let videoTimescale = 0;
-      let trakPos = 0;
-      while ((trakPos = findSequence(u8, [0x74, 0x72, 0x61, 0x6b], trakPos)) !== -1) {
-        const trakEnd = Math.min(u8.length, trakPos + 16000);
-        const trakSlice = u8.subarray(trakPos, trakEnd);
-        const isVide = findSequence(trakSlice, [0x76, 0x69, 0x64, 0x65]) !== -1;
-        if (isVide) {
-          const mdhdPos = findSequence(trakSlice, [0x6d, 0x64, 0x68, 0x64]);
-          if (mdhdPos !== -1) {
-            const globalMdhd = trakPos + mdhdPos;
-            const ver = u8[globalMdhd + 4];
-            const tsOffset = globalMdhd + (ver === 0 ? 16 : 24);
-            if (tsOffset + 4 <= u8.length) {
-              videoTimescale = view.getUint32(tsOffset);
+      // Check MP4 vide handler
+      const videPos = findSequence(u8, [0x76, 0x69, 0x64, 0x65]);
+      if (videPos !== -1) {
+        // Look backwards for mdhd within 1000 bytes
+        let mdhdPos = -1;
+        for (let p = Math.max(0, videPos - 1000); p < videPos; p++) {
+          if (u8[p] === 0x6d && u8[p + 1] === 0x64 && u8[p + 2] === 0x68 && u8[p + 3] === 0x64) {
+            mdhdPos = p;
+            break;
+          }
+        }
+
+        let videoTimescale = 0;
+        if (mdhdPos !== -1) {
+          const ver = u8[mdhdPos + 4];
+          const tsOffset = mdhdPos + (ver === 0 ? 16 : 24);
+          if (tsOffset + 4 <= u8.length) {
+            videoTimescale = view.getUint32(tsOffset);
+          }
+        }
+
+        // Look forwards for stts within 120,000 bytes
+        const sttsPos = findSequence(u8, [0x73, 0x74, 0x74, 0x73], videPos, Math.min(u8.length, videPos + 120000));
+        if (sttsPos !== -1 && videoTimescale > 0) {
+          const count = view.getUint32(sttsPos + 8);
+          if (count > 0) {
+            let totalSamples = 0;
+            let totalDur = 0;
+            const entriesToRead = Math.min(count, 128);
+            for (let i = 0; i < entriesToRead; i++) {
+              const entryOff = sttsPos + 12 + i * 8;
+              if (entryOff + 8 <= u8.length) {
+                const sCount = view.getUint32(entryOff);
+                const sDelta = view.getUint32(entryOff + 4);
+                totalSamples += sCount;
+                totalDur += sCount * sDelta;
+              }
+            }
+            if (totalDur > 0 && totalSamples > 0) {
+              const calc = (videoTimescale * totalSamples) / totalDur;
+              if (calc >= 15 && calc <= 144) {
+                fps = Math.round(calc);
+                foundFps = true;
+                return { fps, hasAudio, timescale: videoTimescale };
+              }
             }
           }
+        }
 
-          // Check stts (time-to-sample) inside this video trak
-          const sttsPos = findSequence(trakSlice, [0x73, 0x74, 0x74, 0x73]);
-          if (sttsPos !== -1 && videoTimescale > 0) {
-            const globalStts = trakPos + sttsPos;
-            const entryCount = view.getUint32(globalStts + 8);
-            if (entryCount > 0) {
-              let totalSamples = 0;
-              let totalDur = 0;
-              const entriesToRead = Math.min(entryCount, 32);
-              for (let e = 0; e < entriesToRead; e++) {
-                const entryOff = globalStts + 12 + e * 8;
-                if (entryOff + 8 <= u8.length) {
-                  const sCount = view.getUint32(entryOff);
-                  const sDelta = view.getUint32(entryOff + 4);
-                  totalSamples += sCount;
-                  totalDur += sCount * sDelta;
-                }
-              }
-              if (totalDur > 0 && totalSamples > 0) {
-                const calcFps = (videoTimescale * totalSamples) / totalDur;
-                if (calcFps >= 10 && calcFps <= 144) {
-                  fps = Math.round(calcFps);
+        // If fragmented MP4 (fMP4), look for trun
+        if (!foundFps && videoTimescale > 0) {
+          const trunPos = findSequence(u8, [0x74, 0x72, 0x75, 0x6e]);
+          if (trunPos !== -1) {
+            const flags = (u8[trunPos + 5] << 16) | (u8[trunPos + 6] << 8) | u8[trunPos + 7];
+            let off = trunPos + 12;
+            if (flags & 0x0001) off += 4;
+            if (flags & 0x0004) off += 4;
+            if (flags & 0x0100 && off + 4 <= u8.length) {
+              const dur = view.getUint32(off);
+              if (dur > 0) {
+                const calc = videoTimescale / dur;
+                if (calc >= 15 && calc <= 144) {
+                  fps = Math.round(calc);
                   foundFps = true;
-                }
-              }
-            }
-          }
-          break;
-        }
-        trakPos += 4;
-      }
-
-      // If stts was 0 or not found (e.g. fragmented MP4 / fMP4), check trun
-      if (!foundFps && videoTimescale > 0) {
-        const trunPos = findSequence(u8, [0x74, 0x72, 0x75, 0x6e]);
-        if (trunPos !== -1) {
-          const flags = (u8[trunPos + 5] << 16) | (u8[trunPos + 6] << 8) | u8[trunPos + 7];
-          const hasDur = (flags & 0x000100) !== 0;
-          if (hasDur) {
-            let offset = trunPos + 12;
-            if ((flags & 0x000001) !== 0) offset += 4;
-            if ((flags & 0x000004) !== 0) offset += 4;
-            if (offset + 4 <= u8.length) {
-              const sampleDur = view.getUint32(offset);
-              if (sampleDur > 0) {
-                const calcFps = videoTimescale / sampleDur;
-                if (calcFps >= 10 && calcFps <= 144) {
-                  fps = Math.round(calcFps);
-                  foundFps = true;
+                  return { fps, hasAudio, timescale: videoTimescale };
                 }
               }
             }
@@ -542,109 +534,29 @@ const parseVideoFileHeader = async (file: File): Promise<VideoFileInfo> => {
         }
       }
 
-      return { fps, hasAudio, timescale: videoTimescale };
-    }
-
-    // Check WebM
-    if (u8.length >= 4 && u8[0] === 0x1a && u8[1] === 0x45 && u8[2] === 0xdf && u8[3] === 0xa3) {
-      if (findSequence(u8, [0x83, 0x02]) !== -1) {
-        hasAudio = true;
-      }
-      const durPos = findSequence(u8, [0x23, 0xe3, 0x83]);
-      if (durPos !== -1 && durPos + 7 <= u8.length) {
-        const sizeByte = u8[durPos + 3] & 0x0f;
-        if (sizeByte === 4) {
-          const ns = view.getUint32(durPos + 4);
-          if (ns > 0) {
-            const calcFps = 1e9 / ns;
-            if (calcFps >= 10 && calcFps <= 144) fps = Math.round(calcFps);
+      // Check WebM
+      if (u8.length >= 4 && u8[0] === 0x1a && u8[1] === 0x45 && u8[2] === 0xdf && u8[3] === 0xa3) {
+        const durPos = findSequence(u8, [0x23, 0xe3, 0x83]);
+        if (durPos !== -1 && durPos + 7 <= u8.length) {
+          const sizeByte = u8[durPos + 3] & 0x0f;
+          if (sizeByte === 4) {
+            const ns = view.getUint32(durPos + 4);
+            if (ns > 0) {
+              const calc = 1e9 / ns;
+              if (calc >= 15 && calc <= 144) {
+                fps = Math.round(calc);
+                return { fps, hasAudio };
+              }
+            }
           }
         }
       }
-      return { fps, hasAudio };
     }
 
     return { fps: 30, hasAudio: true };
   } catch (err) {
     return { fps: 30, hasAudio: true };
   }
-};
-
-const probeVideoFps = (file: File): Promise<number> => {
-  return new Promise((resolve) => {
-    try {
-      const video = document.createElement('video');
-      video.preload = 'auto';
-      video.muted = true;
-      video.defaultMuted = true;
-      video.volume = 0;
-      video.playsInline = true;
-      (video as any).webkitPlaysInline = true;
-
-      const blobUrl = URL.createObjectURL(file);
-      video.src = blobUrl;
-
-      let resolved = false;
-      const cleanup = (fps: number) => {
-        if (resolved) return;
-        resolved = true;
-        video.pause();
-        video.removeAttribute('src');
-        video.load();
-        URL.revokeObjectURL(blobUrl);
-        resolve(fps);
-      };
-
-      const timer = setTimeout(() => {
-        cleanup(30);
-      }, 1500);
-
-      video.onloadedmetadata = () => {
-        if (!('requestVideoFrameCallback' in video)) {
-          clearTimeout(timer);
-          cleanup(30);
-          return;
-        }
-
-        const frameTimes: number[] = [];
-        const onFrame = (_now: number, metadata: any) => {
-          if (resolved) return;
-          if (metadata && typeof metadata.mediaTime === 'number') {
-            frameTimes.push(metadata.mediaTime);
-            if (frameTimes.length >= 3) {
-              const d1 = Math.abs(frameTimes[1] - frameTimes[0]);
-              const d2 = Math.abs(frameTimes[2] - frameTimes[1]);
-              const avgD = (d1 + d2) / 2;
-              if (avgD > 0.005 && avgD < 0.1) {
-                const calc = Math.round(1 / avgD);
-                if (calc >= 12 && calc <= 144) {
-                  clearTimeout(timer);
-                  cleanup(calc);
-                  return;
-                }
-              }
-            }
-          }
-          if (frameTimes.length < 8 && !video.paused && !resolved) {
-            (video as any).requestVideoFrameCallback(onFrame);
-          }
-        };
-
-        (video as any).requestVideoFrameCallback(onFrame);
-        video.play().catch(() => {
-          clearTimeout(timer);
-          cleanup(30);
-        });
-      };
-
-      video.onerror = () => {
-        clearTimeout(timer);
-        cleanup(30);
-      };
-    } catch {
-      resolve(30);
-    }
-  });
 };
 
 // ==========================================
@@ -1584,15 +1496,12 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
     const options = [
       { value: 'keep', label: `Original Frame Rate (${detectedFps} FPS)` }
     ];
-    if (detectedFps !== 60 && detectedFps !== 30 && detectedFps !== 24 && detectedFps >= 15) {
+    if (detectedFps !== 60 && detectedFps !== 50 && detectedFps !== 30 && detectedFps !== 24 && detectedFps >= 15) {
       options.push({ value: String(detectedFps), label: `${detectedFps} FPS (Match Source)` });
     }
-    if (detectedFps >= 45) {
-      options.push({ value: '60', label: '60 FPS (Ultra Smooth)' });
-    }
-    if (detectedFps >= 26) {
-      options.push({ value: '30', label: '30 FPS (Standard Web & Mobile)' });
-    }
+    options.push({ value: '60', label: '60 FPS (Ultra Smooth)' });
+    options.push({ value: '50', label: '50 FPS (PAL Smooth)' });
+    options.push({ value: '30', label: '30 FPS (Standard Web & Mobile)' });
     options.push({ value: '24', label: '24 FPS (Fast Chat / WhatsApp)' });
     return options;
   }, [metadata.fps]);
@@ -1696,15 +1605,6 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         hasAudio: info.hasAudio
       }));
     });
-
-    probeVideoFps(selected).then((realFps) => {
-      if (realFps && realFps >= 12 && realFps <= 144) {
-        setMetadata((prev) => ({
-          ...prev,
-          fps: realFps
-        }));
-      }
-    });
   };
 
   const handleDrop = (e: React.DragEvent) => {
@@ -1727,15 +1627,6 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
           fps: info.fps,
           hasAudio: info.hasAudio
         }));
-      });
-
-      probeVideoFps(dropped).then((realFps) => {
-        if (realFps && realFps >= 12 && realFps <= 144) {
-          setMetadata((prev) => ({
-            ...prev,
-            fps: realFps
-          }));
-        }
       });
     }
   };
@@ -2507,33 +2398,6 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
                           width: w > 0 ? w : 1280,
                           height: h > 0 ? h : 720
                         }));
-
-                        // Secondary dynamic probe: detect exact presentation FPS when frames play
-                        if ('requestVideoFrameCallback' in v) {
-                          let lastT = -1;
-                          const samples: number[] = [];
-                          const probe = (_now: number, metadata: any) => {
-                            if (metadata && typeof metadata.mediaTime === 'number') {
-                              if (lastT >= 0) {
-                                const dt = metadata.mediaTime - lastT;
-                                if (dt > 0.005 && dt < 0.1) samples.push(dt);
-                              }
-                              lastT = metadata.mediaTime;
-                            }
-                            if (samples.length >= 3) {
-                              const avgDt = samples.reduce((a, b) => a + b, 0) / samples.length;
-                              if (avgDt > 0.005) {
-                                const detected = Math.round(1 / avgDt);
-                                if (detected >= 12 && detected <= 144) {
-                                  setMetadata((prev) => ({ ...prev, fps: detected }));
-                                }
-                              }
-                            } else if (!v.paused) {
-                              (v as any).requestVideoFrameCallback(probe);
-                            }
-                          };
-                          (v as any).requestVideoFrameCallback(probe);
-                        }
                       }}
                     />
                   ) : (
