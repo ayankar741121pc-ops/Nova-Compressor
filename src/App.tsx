@@ -1969,22 +1969,33 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       let animationFrameId: number | null = null;
       let renderIntervalId: number | null = null;
       let watchdogTimer: number | null = null;
-      let lastTime = -1;
-      let stallCount = 0;
       let frameCount = 0;
+      let lastRenderMediaTime = -1;
+      let lastAdvanceWallTime = performance.now();
+      let lastAdvanceVideoTime = -1;
+      let lastReportedPct = -1;
+      let lastUiUpdateTime = 0;
 
       const finishEncoding = () => {
         if (hasEnded) return;
         hasEnded = true;
-        if (renderIntervalId !== null) window.clearInterval(renderIntervalId);
-        if (watchdogTimer !== null) window.clearInterval(watchdogTimer);
+        if (renderIntervalId !== null) {
+          window.clearInterval(renderIntervalId);
+          renderIntervalId = null;
+        }
+        if (watchdogTimer !== null) {
+          window.clearInterval(watchdogTimer);
+          watchdogTimer = null;
+        }
         if (frameCallbackId !== null && 'cancelVideoFrameCallback' in hiddenVideo) {
           try {
             (hiddenVideo as any).cancelVideoFrameCallback(frameCallbackId);
           } catch {}
+          frameCallbackId = null;
         }
         if (animationFrameId !== null) {
           cancelAnimationFrame(animationFrameId);
+          animationFrameId = null;
         }
         if (audioCtx) {
           audioCtx.close().catch(() => {});
@@ -1998,22 +2009,24 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         }
       };
 
-      let lastRenderMediaTime = -1;
-
-      const renderCurrentFrame = (mediaTime?: number) => {
+      const renderCurrentFrame = (_mediaTime?: number) => {
         if (hasEnded || abortRef.current) return;
         
         const currentT = hiddenVideo.currentTime;
-        // Avoid duplicate drawing if video hasn't progressed:
-        if (typeof mediaTime === 'number') {
-          if (mediaTime === lastRenderMediaTime) return;
-          lastRenderMediaTime = mediaTime;
-        } else if (currentT === lastRenderMediaTime) {
-          return;
-        } else {
-          lastRenderMediaTime = currentT;
+
+        // Track forward video playback progression:
+        if (lastAdvanceVideoTime < 0 || currentT >= lastAdvanceVideoTime + 0.02) {
+          lastAdvanceWallTime = performance.now();
+          lastAdvanceVideoTime = currentT;
         }
 
+        // Avoid duplicate drawing if video hasn't progressed by at least 8ms (filters out audio clock jitter & duplicate ticks):
+        if (lastRenderMediaTime >= 0 && Math.abs(currentT - lastRenderMediaTime) < 0.008) {
+          return;
+        }
+        lastRenderMediaTime = currentT;
+
+        // Render visual frame:
         ctx.drawImage(hiddenVideo, 0, 0, targetW, targetH);
         frameCount++;
 
@@ -2022,17 +2035,24 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         }
         const effectiveDuration = Number.isFinite(duration) && duration > 0.5 ? duration : 10;
         const pct = Math.min(99, Math.max(8, Math.round((currentT / effectiveDuration) * 100)));
-        setProgress(pct);
 
-        if (pct < 15) {
-          setProgressText(`⚡ Encoding ${targetW}x${targetH} @ strictly ${targetFps} FPS...`);
-        } else if (pct < 85) {
-          setProgressText(`✨ Optimizing ${targetW}x${targetH} (${frameCount} frames @ ${targetFps} FPS)...`);
-        } else {
-          setProgressText('📦 Finalizing MP4 container & audio sync...');
+        // Throttle React state updates to prevent mobile thread saturation:
+        const now = performance.now();
+        if (pct !== lastReportedPct || now - lastUiUpdateTime > 80) {
+          lastReportedPct = pct;
+          lastUiUpdateTime = now;
+          setProgress(pct);
+
+          if (pct < 15) {
+            setProgressText(`⚡ Encoding ${targetW}x${targetH} @ strictly ${targetFps} FPS...`);
+          } else if (pct < 85) {
+            setProgressText(`✨ Optimizing ${targetW}x${targetH} (${frameCount} frames @ ${targetFps} FPS)...`);
+          } else {
+            setProgressText('📦 Finalizing MP4 container & audio sync...');
+          }
         }
 
-        if (hiddenVideo.currentTime >= effectiveDuration - 0.08 || hiddenVideo.ended) {
+        if (currentT >= effectiveDuration - 0.15 || hiddenVideo.ended) {
           finishEncoding();
         }
       };
@@ -2049,19 +2069,52 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         finishEncoding();
       };
 
+      // Watchdog: ensures complete finalization and detects stream end / stalls (fixes 83% stall & runaway 5000+ frames)
       watchdogTimer = window.setInterval(() => {
-        if (abortRef.current) {
+        if (abortRef.current || hasEnded) {
           finishEncoding();
           return;
         }
-        if (hiddenVideo.paused && !hiddenVideo.ended && !hasEnded) {
+
+        const effectiveDuration = Number.isFinite(duration) && duration > 0.5 ? duration : 10;
+        const currentT = hiddenVideo.currentTime;
+        const stallMs = performance.now() - lastAdvanceWallTime;
+
+        // 1. Reached close to container duration or video naturally ended:
+        if (currentT >= effectiveDuration - 0.15 || hiddenVideo.ended) {
+          finishEncoding();
+          return;
+        }
+
+        // 2. Safety frame limit: cap frame count to physical max frames so it can NEVER runaway to 5000+
+        const maxFramesAllowed = Math.ceil(effectiveDuration * targetFps * 1.15) + 30;
+        if (frameCount >= maxFramesAllowed) {
+          finishEncoding();
+          return;
+        }
+
+        // 3. Android stream end / stall detection (stops 83% freeze & phone lag):
+        if (stallMs > 1200) {
+          // If we reached >= 70% of duration, or video paused near end, stream has reached natural EOF:
+          if (currentT >= effectiveDuration * 0.70 || hiddenVideo.paused) {
+            finishEncoding();
+            return;
+          }
+
+          // Earlier stall (< 70%): try nudging playback once
+          if (stallMs < 2500) {
+            if (hiddenVideo.paused) {
+              hiddenVideo.play().catch(() => {});
+            }
+          } else {
+            // Stalled for > 2.5s without any progress: finalize gracefully to never hang the phone
+            finishEncoding();
+            return;
+          }
+        } else if (hiddenVideo.paused && !hiddenVideo.ended && !hasEnded) {
           hiddenVideo.play().catch(() => {});
         }
-        const effectiveDuration = Number.isFinite(duration) && duration > 0.5 ? duration : 10;
-        if (hiddenVideo.currentTime >= effectiveDuration - 0.08) {
-          finishEncoding();
-        }
-      }, 300);
+      }, 200);
 
       // Pause preview player to free up Android hardware decoder session
       if (videoRef.current) {
@@ -2108,11 +2161,14 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       }
 
       setProgressText('Fixing container duration for WhatsApp & Gallery compatibility...');
-      // CRITICAL: NEVER calculate duration from (frameCount / targetFps)!
-      // The true video duration must always be used so the container is never truncated to 4 seconds!
-      const exactDuration = Number.isFinite(hiddenVideo.duration) && hiddenVideo.duration > 0.1 
+      // CRITICAL: Use the actual recorded time if stream ended earlier than container header
+      const recordedDuration = lastRenderMediaTime > 0.5 ? lastRenderMediaTime : hiddenVideo.currentTime;
+      const nominalDuration = Number.isFinite(hiddenVideo.duration) && hiddenVideo.duration > 0.1 
         ? hiddenVideo.duration 
         : (duration > 0.1 ? duration : 10);
+      const exactDuration = (recordedDuration > 0.5 && recordedDuration < nominalDuration - 0.5)
+        ? recordedDuration
+        : nominalDuration;
       const finalBlob = await fixMediaDuration(rawBlob, exactDuration);
 
       setProgress(100);
