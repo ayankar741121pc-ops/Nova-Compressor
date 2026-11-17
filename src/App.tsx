@@ -1833,14 +1833,16 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       hiddenVideo.volume = 0;
       hiddenVideo.setAttribute('muted', '');
 
-      // CRITICAL FOR MOBILE: Give element real dimensions in viewport behind opaque UI.
-      // Do NOT set 2px width or 0.01 opacity, which triggers Android Chromium power-saver throttling (10-14 FPS or 0 FPS stall).
+      // CRITICAL FOR MOBILE: Give element dimensions and keep in foreground viewport.
+      // Do NOT set z-index: -999 or 0 opacity, which triggers Android Chromium "Occluded Video Throttling" (0 FPS freeze).
+      // Set opacity: 0.001 with zIndex: 1 so Chromium compositor treats it as an active foreground video element!
       hiddenVideo.style.position = 'fixed';
       hiddenVideo.style.top = '0px';
       hiddenVideo.style.left = '0px';
-      hiddenVideo.style.width = '320px';
-      hiddenVideo.style.height = '240px';
-      hiddenVideo.style.zIndex = '-999';
+      hiddenVideo.style.width = '160px';
+      hiddenVideo.style.height = '120px';
+      hiddenVideo.style.opacity = '0.001';
+      hiddenVideo.style.zIndex = '1';
       hiddenVideo.style.pointerEvents = 'none';
       document.body.appendChild(hiddenVideo);
 
@@ -1955,13 +1957,42 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
       };
 
       const encodedBlobPromise = new Promise<Blob>((resolve, reject) => {
+        let isDone = false;
+        const complete = () => {
+          if (isDone) return;
+          isDone = true;
+          if (chunks.length > 0) {
+            resolve(new Blob(chunks, { type: baseMime }));
+          } else {
+            reject(new Error('Encoder output was empty. Please try another format or resolution.'));
+          }
+        };
+
         recorder.onstop = () => {
-          const rawBlob = new Blob(chunks, { type: baseMime });
-          resolve(rawBlob);
+          complete();
         };
+
         recorder.onerror = (event: any) => {
-          reject(new Error(event?.error?.message || 'Hardware encoder error occurred.'));
+          console.warn('Recorder error event:', event);
+          if (chunks.length > 0) {
+            complete();
+          } else {
+            reject(new Error(event?.error?.message || 'Hardware encoder error occurred.'));
+          }
         };
+
+        // SAFETY WATCHDOG: If finishEncoding was called and onstop hasn't fired after 1000ms, force finalization
+        const safetyInterval = setInterval(() => {
+          if (hasEnded) {
+            clearInterval(safetyInterval);
+            setTimeout(() => {
+              if (!isDone && chunks.length > 0) {
+                console.warn('Recorder onstop timeout - forcing finalization with collected chunks');
+                complete();
+              }
+            }, 800);
+          }
+        }, 150);
       });
 
       let hasEnded = false;
@@ -1997,15 +2028,13 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
           cancelAnimationFrame(animationFrameId);
           animationFrameId = null;
         }
-        if (audioCtx) {
-          audioCtx.close().catch(() => {});
-          audioCtx = null;
-          activeAudioCtxRef.current = null;
-        }
-        if (recorder.state !== 'inactive') {
+        // CRITICAL FIX: Flush and stop recorder FIRST while audioCtx is still alive!
+        if (recorder && recorder.state !== 'inactive') {
           try {
             recorder.stop();
-          } catch {}
+          } catch (e) {
+            console.warn('Recorder stop error:', e);
+          }
         }
       };
 
@@ -2080,6 +2109,11 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         const currentT = hiddenVideo.currentTime;
         const stallMs = performance.now() - lastAdvanceWallTime;
 
+        // Pumper fallback: if requestVideoFrameCallback was delayed or throttled by mobile power saver:
+        if (!hasEnded && !hiddenVideo.paused) {
+          renderCurrentFrame();
+        }
+
         // 1. Reached close to container duration or video naturally ended:
         if (currentT >= effectiveDuration - 0.15 || hiddenVideo.ended) {
           finishEncoding();
@@ -2094,20 +2128,20 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         }
 
         // 3. Android stream end / stall detection (stops 83% freeze & phone lag):
-        if (stallMs > 1200) {
-          // If we reached >= 70% of duration, or video paused near end, stream has reached natural EOF:
-          if (currentT >= effectiveDuration * 0.70 || hiddenVideo.paused) {
+        if (stallMs > 1000) {
+          // If we reached >= 60% of duration, or video paused near end, stream has reached natural EOF:
+          if (currentT >= effectiveDuration * 0.60 || hiddenVideo.paused) {
             finishEncoding();
             return;
           }
 
-          // Earlier stall (< 70%): try nudging playback once
-          if (stallMs < 2500) {
+          // Earlier stall (< 60%): try nudging playback once
+          if (stallMs < 2000) {
             if (hiddenVideo.paused) {
               hiddenVideo.play().catch(() => {});
             }
           } else {
-            // Stalled for > 2.5s without any progress: finalize gracefully to never hang the phone
+            // Stalled for > 2.0s without any progress: finalize gracefully to never hang the phone
             finishEncoding();
             return;
           }
@@ -2123,9 +2157,12 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
         } catch {}
       }
 
-      // Safe playback start:
+      // Safe playback start with timeout:
       try {
-        await hiddenVideo.play();
+        await Promise.race([
+          hiddenVideo.play(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('play_timeout')), 1500))
+        ]);
       } catch (playErr) {
         console.warn('Playback error, retrying muted:', playErr);
         hiddenVideo.muted = true;
@@ -2146,6 +2183,13 @@ const VideoTool = ({ defaultMode = 'compress' }) => {
 
       const rawBlob = await encodedBlobPromise;
       finishEncoding();
+
+      // Safely close audio context now that recording is complete:
+      if (audioCtx) {
+        audioCtx.close().catch(() => {});
+        audioCtx = null;
+        activeAudioCtxRef.current = null;
+      }
 
       if (hiddenVideo.parentNode) {
         hiddenVideo.parentNode.removeChild(hiddenVideo);
